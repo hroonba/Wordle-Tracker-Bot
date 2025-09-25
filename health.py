@@ -9,6 +9,5 @@ class H(BaseHTTPRequestHandler):
         self.wfile.write(b"ok")
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", "8080"))  # use Render's PORT if set
+    port = int(os.environ.get("PORT", "8080"))  # Render provides PORT
     HTTPServer(("0.0.0.0", port), H).serve_forever()
-
