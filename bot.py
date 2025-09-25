@@ -105,29 +105,16 @@ def fetch_leaderboard(days_back: int, min_games: int = 5) -> List[Tuple]:
         """, (min_day, max_day, min_games))
         return list(cur.fetchall())
 
-# ---- Parsing for your group's daily summary ---------------------------------
-# Examples:
-# "👑 2/6: @UserA"
-# "3/6: @UserB @UserC @UserD"
-# Day number often appears as "Wordle No. 1558" (content or embed title)
-
+# --- replace your parse_group_summary_style(...) with this version ---
 DAY_RE_TEXT = re.compile(r"\bWordle\s+(?:No\.?\s*)?(?P<day>\d+)\b", re.IGNORECASE)
-SCORE_LINE_RE = re.compile(r"^(?:👑\s*)?(?P<score>[Xx]|\d)\/6:\s*(?P<rest>.+)$")
-
-@dataclass
-class ParsedScore:
-    user_id: Optional[int]
-    username: str
-    day: int
-    score: Optional[int]   # None => X
-    solved: bool
+SCORE_LINE_RE = re.compile(r"^(?:\*\*)?(?:👑\s*)?(?P<score>[Xx]|\d)\/6:\s*(?P<rest>.+)$")
 
 def _extract_day_from_message(msg: discord.Message) -> Optional[int]:
-    # 1) Try plain text
+    # Try plain text
     m = DAY_RE_TEXT.search(msg.content or "")
     if m:
         return int(m.group("day"))
-    # 2) Look inside embeds (title/description)
+    # Try embeds (title/description)
     for emb in msg.embeds:
         if emb.title:
             m = DAY_RE_TEXT.search(emb.title)
@@ -140,47 +127,58 @@ def _extract_day_from_message(msg: discord.Message) -> Optional[int]:
     return None
 
 def parse_group_summary_style(msg: discord.Message) -> List[ParsedScore]:
-    """Parses the '2/6: @A @B' multi-mention lines and returns scores."""
+    """
+    Parses lines like:
+      '👑 2/6: @Where Jon Al Gaib'
+      '3/6: <@2866> <@1296> <@2680> <@3827>'
+      '4/6: <@1486>'
+    Returns a list[ParsedScore].
+    """
     day = _extract_day_from_message(msg)
     if day is None:
         return []
 
     results: List[ParsedScore] = []
-    lines = (msg.content or "").splitlines()
-    if not lines:
-        return []
 
-    # For each line like "3/6: <mentions...>"
-    for line in lines:
-        line = line.strip()
+    for raw in (msg.content or "").splitlines():
+        line = raw.strip()
         m = SCORE_LINE_RE.match(line)
         if not m:
             continue
 
         raw_score = m.group("score")
+        rest = m.group("rest").strip()
+
         score_val = None if raw_score.lower() == "x" else int(raw_score)
         solved = score_val is not None
 
-        # Grab mention IDs present in this line
-        ids_in_line = [int(mid.group("id")) for mid in re.finditer(r"<@!?(?P<id>\d+)>", line)]
-        if ids_in_line:
-            # Map mention ids -> Member objects if available in message.mentions
-            id_to_member = {m.id: m for m in msg.mentions}
-            for uid in ids_in_line:
+        # 1) Prefer actual Discord mentions (robust; works for multiple)
+        mention_ids = [int(mm.group("id")) for mm in re.finditer(r"<@!?(?P<id>\d+)>", rest)]
+        if mention_ids:
+            id_to_member = {mem.id: mem for mem in msg.mentions}
+            for uid in mention_ids:
                 member = id_to_member.get(uid)
                 username = member.display_name if member else f"user:{uid}"
                 results.append(ParsedScore(user_id=uid, username=username, day=day,
                                            score=score_val, solved=solved))
-        else:
-            # Fallback: if the bot used plain @Name text (no actual mentions)
-            # split words and pick tokens starting with '@'
-            tokens = [t for t in m.group("rest").split() if t.startswith("@")]
-            for name in tokens:
-                # store without id; we still keep a row using 0 as user_id
-                username = name.lstrip("@")
-                results.append(ParsedScore(user_id=0, username=username, day=day,
-                                           score=score_val, solved=solved))
+            continue
+
+        # 2) Fallback: no real mentions — treat the whole tail as ONE display name.
+        #    This captures spaced names like '@Where Jon Al Gaib'.
+        #    Strip a leading '@' if present and any bold markers that Discord may add.
+        username = rest
+        # remove leading markdown ** … ** if someone copied bold
+        if username.startswith("**") and username.endswith("**"):
+            username = username[2:-2].strip()
+        if username.startswith("@"):
+            username = username[1:].strip()
+
+        if username:  # store with user_id=0 (unknown) but keep the display name
+            results.append(ParsedScore(user_id=0, username=username, day=day,
+                                       score=score_val, solved=solved))
+
     return results
+
 
 # ---- Scope helper -----------------------------------------------------------
 def message_in_scope(msg: discord.Message) -> bool:
