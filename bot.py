@@ -15,14 +15,14 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
-# dotenv is optional on Render; handy locally
+# dotenv is optional on Render; useful locally
 try:
     from dotenv import load_dotenv
     load_dotenv()
 except Exception:
     pass
 
-# Headless plotting
+# Headless plotting on servers
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -30,7 +30,7 @@ import matplotlib.pyplot as plt
 # ---- Config -----------------------------------------------------------------
 TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 WORDLE_CHANNEL_ID = int(os.getenv("WORDLE_CHANNEL_ID") or "0")   # optional
-WORDLE_BOT_ID = int(os.getenv("WORDLE_BOT_ID") or "0")           # strongly recommended
+WORDLE_BOT_ID = int(os.getenv("WORDLE_BOT_ID") or "0")           # recommended
 DB_PATH = os.getenv("DB_PATH") or "wordle_scores.db"
 
 INTENTS = discord.Intents.default()
@@ -62,8 +62,10 @@ def upsert_score(user_id: int, username: str, day: int, score: Optional[int], so
                 score=excluded.score,
                 solved=excluded.solved,
                 ts=excluded.ts;
-        """, (user_id, username, day, None if score is None else score,
-              1 if solved else 0, dt.datetime.utcnow().isoformat()))
+        """, (user_id, username, day,
+              None if score is None else score,
+              1 if solved else 0,
+              dt.datetime.utcnow().isoformat()))
 
 def fetch_scores(days_back: int, user_id: Optional[int] = None) -> List[Tuple]:
     with sqlite3.connect(DB_PATH) as con:
@@ -105,16 +107,28 @@ def fetch_leaderboard(days_back: int, min_games: int = 5) -> List[Tuple]:
         """, (min_day, max_day, min_games))
         return list(cur.fetchall())
 
-# --- replace your parse_group_summary_style(...) with this version ---
+# ---- Data model used by parsers (define BEFORE using it) --------------------
+@dataclass
+class ParsedScore:
+    user_id: Optional[int]
+    username: str
+    day: int
+    score: Optional[int]   # None => X
+    solved: bool
+
+# ---- Parsing for your group's daily summary ---------------------------------
+# Example lines:
+#   "👑 2/6: @Where Jon Al Gaib"
+#   "3/6: <@2866475...> <@1296962...> ..."
 DAY_RE_TEXT = re.compile(r"\bWordle\s+(?:No\.?\s*)?(?P<day>\d+)\b", re.IGNORECASE)
 SCORE_LINE_RE = re.compile(r"^(?:\*\*)?(?:👑\s*)?(?P<score>[Xx]|\d)\/6:\s*(?P<rest>.+)$")
 
 def _extract_day_from_message(msg: discord.Message) -> Optional[int]:
-    # Try plain text
+    # Text
     m = DAY_RE_TEXT.search(msg.content or "")
     if m:
         return int(m.group("day"))
-    # Try embeds (title/description)
+    # Embeds
     for emb in msg.embeds:
         if emb.title:
             m = DAY_RE_TEXT.search(emb.title)
@@ -132,14 +146,12 @@ def parse_group_summary_style(msg: discord.Message) -> List[ParsedScore]:
       '👑 2/6: @Where Jon Al Gaib'
       '3/6: <@2866> <@1296> <@2680> <@3827>'
       '4/6: <@1486>'
-    Returns a list[ParsedScore].
     """
     day = _extract_day_from_message(msg)
     if day is None:
         return []
 
     results: List[ParsedScore] = []
-
     for raw in (msg.content or "").splitlines():
         line = raw.strip()
         m = SCORE_LINE_RE.match(line)
@@ -148,11 +160,10 @@ def parse_group_summary_style(msg: discord.Message) -> List[ParsedScore]:
 
         raw_score = m.group("score")
         rest = m.group("rest").strip()
-
         score_val = None if raw_score.lower() == "x" else int(raw_score)
         solved = score_val is not None
 
-        # 1) Prefer actual Discord mentions (robust; works for multiple)
+        # Prefer actual mentions
         mention_ids = [int(mm.group("id")) for mm in re.finditer(r"<@!?(?P<id>\d+)>", rest)]
         if mention_ids:
             id_to_member = {mem.id: mem for mem in msg.mentions}
@@ -163,22 +174,16 @@ def parse_group_summary_style(msg: discord.Message) -> List[ParsedScore]:
                                            score=score_val, solved=solved))
             continue
 
-        # 2) Fallback: no real mentions — treat the whole tail as ONE display name.
-        #    This captures spaced names like '@Where Jon Al Gaib'.
-        #    Strip a leading '@' if present and any bold markers that Discord may add.
+        # Fallback: treat entire remainder as a single display name (handles '@Where Jon Al Gaib')
         username = rest
-        # remove leading markdown ** … ** if someone copied bold
         if username.startswith("**") and username.endswith("**"):
             username = username[2:-2].strip()
         if username.startswith("@"):
             username = username[1:].strip()
-
-        if username:  # store with user_id=0 (unknown) but keep the display name
+        if username:
             results.append(ParsedScore(user_id=0, username=username, day=day,
                                        score=score_val, solved=solved))
-
     return results
-
 
 # ---- Scope helper -----------------------------------------------------------
 def message_in_scope(msg: discord.Message) -> bool:
@@ -200,26 +205,22 @@ async def on_ready():
 
 @bot.event
 async def on_message(message: discord.Message):
-    # Ignore our own messages
     if bot.user and message.author.id == bot.user.id:
         return
     if not message_in_scope(message):
         return
 
-    # Parse your Wordle bot's group summary
-    # (Prefer setting WORDLE_BOT_ID to that bot's numeric ID)
+    # Parse the Wordle bot's daily summary
     try:
         if (WORDLE_BOT_ID and message.author.id == WORDLE_BOT_ID) or \
            (not WORDLE_BOT_ID and message.author.bot):
-            parsed = parse_group_summary_style(message)
-            for p in parsed:
+            for p in parse_group_summary_style(message):
                 upsert_score(p.user_id or 0, p.username, p.day, p.score, p.solved)
-            # Don't return here; we still want to catch human shares below if present
     except Exception:
         print("Error parsing group summary:")
         traceback.print_exc()
 
-    # Also capture human shares like "Wordle 1558 3/6" if people post them
+    # Also capture human shares like "Wordle 1558 3/6"
     try:
         m = re.search(r"\bWordle\s+(?P<day>\d+)\s+(?P<score>[Xx]|\d)\/6\b",
                       message.content or "", re.IGNORECASE)
@@ -371,7 +372,6 @@ async def rescan(interaction: discord.Interaction, limit: Optional[int] = 500):
             if not message_in_scope(msg):
                 continue
 
-            # Group summary messages
             if (WORDLE_BOT_ID and msg.author.id == WORDLE_BOT_ID) or \
                (not WORDLE_BOT_ID and msg.author.bot):
                 for p in parse_group_summary_style(msg):
@@ -379,7 +379,6 @@ async def rescan(interaction: discord.Interaction, limit: Optional[int] = 500):
                     parsed += 1
                 continue
 
-            # Human shares
             m = re.search(r"\bWordle\s+(?P<day>\d+)\s+(?P<score>[Xx]|\d)\/6\b",
                           msg.content or "", re.IGNORECASE)
             if m:
