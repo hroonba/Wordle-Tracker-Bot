@@ -15,31 +15,31 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
-# Use dotenv locally; on Render you'll set env vars in the dashboard.
+# dotenv is optional on Render; handy locally
 try:
     from dotenv import load_dotenv
     load_dotenv()
 except Exception:
     pass
 
-# Headless plotting on servers
+# Headless plotting
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 # ---- Config -----------------------------------------------------------------
 TOKEN = os.getenv("DISCORD_BOT_TOKEN")
-WORDLE_CHANNEL_ID = int(os.getenv("WORDLE_CHANNEL_ID") or "0")
-WORDLE_BOT_ID = int(os.getenv("WORDLE_BOT_ID") or "0")
+WORDLE_CHANNEL_ID = int(os.getenv("WORDLE_CHANNEL_ID") or "0")   # optional
+WORDLE_BOT_ID = int(os.getenv("WORDLE_BOT_ID") or "0")           # strongly recommended
 DB_PATH = os.getenv("DB_PATH") or "wordle_scores.db"
 
 INTENTS = discord.Intents.default()
-INTENTS.message_content = True   # needed to read shared Wordle messages
+INTENTS.message_content = True
 INTENTS.members = True
 
 # ---- DB ---------------------------------------------------------------------
 def init_db():
-    with closing(sqlite3.connect(DB_PATH)) as con:
+    with sqlite3.connect(DB_PATH) as con:
         con.execute("""
         CREATE TABLE IF NOT EXISTS scores (
             user_id     INTEGER NOT NULL,
@@ -47,14 +47,13 @@ def init_db():
             day         INTEGER NOT NULL,
             score       INTEGER,           -- 1..6, NULL if X
             solved      INTEGER NOT NULL,  -- 1 if solved, 0 if X
-            ts          TEXT NOT NULL,     -- ISO datetime when captured
+            ts          TEXT NOT NULL,
             PRIMARY KEY (user_id, day)
         );
         """)
-        con.commit()
 
 def upsert_score(user_id: int, username: str, day: int, score: Optional[int], solved: bool):
-    with closing(sqlite3.connect(DB_PATH)) as con:
+    with sqlite3.connect(DB_PATH) as con:
         con.execute("""
             INSERT INTO scores (user_id, username, day, score, solved, ts)
             VALUES (?, ?, ?, ?, ?, ?)
@@ -63,17 +62,14 @@ def upsert_score(user_id: int, username: str, day: int, score: Optional[int], so
                 score=excluded.score,
                 solved=excluded.solved,
                 ts=excluded.ts;
-        """, (user_id, username, day,
-              score if score is not None else None,
-              1 if solved else 0,
-              dt.datetime.utcnow().isoformat()))
-        con.commit()
+        """, (user_id, username, day, None if score is None else score,
+              1 if solved else 0, dt.datetime.utcnow().isoformat()))
 
 def fetch_scores(days_back: int, user_id: Optional[int] = None) -> List[Tuple]:
-    with closing(sqlite3.connect(DB_PATH)) as con:
+    with sqlite3.connect(DB_PATH) as con:
         row = con.execute("SELECT MAX(day) FROM scores;").fetchone()
         max_day = row[0] if row and row[0] is not None else 0
-        min_day = max(0, max_day - days_back + 1)
+        min_day = max(0, max_day - (days_back or 30) + 1)
         if user_id:
             cur = con.execute("""
                 SELECT user_id, username, day, score, solved, ts
@@ -91,10 +87,10 @@ def fetch_scores(days_back: int, user_id: Optional[int] = None) -> List[Tuple]:
         return list(cur.fetchall())
 
 def fetch_leaderboard(days_back: int, min_games: int = 5) -> List[Tuple]:
-    with closing(sqlite3.connect(DB_PATH)) as con:
+    with sqlite3.connect(DB_PATH) as con:
         row = con.execute("SELECT MAX(day) FROM scores;").fetchone()
         max_day = row[0] if row and row[0] is not None else 0
-        min_day = max(0, max_day - days_back + 1)
+        min_day = max(0, max_day - (days_back or 30) + 1)
         cur = con.execute("""
             SELECT user_id, MAX(username),
                    AVG(CASE WHEN solved=1 THEN score ELSE 7 END) AS avg_score,
@@ -109,61 +105,84 @@ def fetch_leaderboard(days_back: int, min_games: int = 5) -> List[Tuple]:
         """, (min_day, max_day, min_games))
         return list(cur.fetchall())
 
-# ---- Parsing ----------------------------------------------------------------
-WORDLE_SHARE_RE = re.compile(
-    r"\bWordle\s+(?P<day>\d+)\s+(?P<score>[Xx]|\d)\/6\b",
-    re.IGNORECASE
-)
+# ---- Parsing for your group's daily summary ---------------------------------
+# Examples:
+# "👑 2/6: @UserA"
+# "3/6: @UserB @UserC @UserD"
+# Day number often appears as "Wordle No. 1558" (content or embed title)
 
-BOT_LINE_RE = re.compile(
-    r"(?P<who>(?:<@!?\d+>)|[\w .'-]{2,32})\s*[—:-]\s*(?P<score>[Xx]|\d)\/6\b"
-)
+DAY_RE_TEXT = re.compile(r"\bWordle\s+(?:No\.?\s*)?(?P<day>\d+)\b", re.IGNORECASE)
+SCORE_LINE_RE = re.compile(r"^(?:👑\s*)?(?P<score>[Xx]|\d)\/6:\s*(?P<rest>.+)$")
 
 @dataclass
 class ParsedScore:
     user_id: Optional[int]
     username: str
     day: int
-    score: Optional[int]   # None means X
+    score: Optional[int]   # None => X
     solved: bool
 
-def parse_human_share(msg: discord.Message) -> Optional[ParsedScore]:
-    m = WORDLE_SHARE_RE.search(msg.content)
-    if not m:
-        return None
-    day = int(m.group("day"))
-    s = m.group("score")
-    if s.lower() == "x":
-        return ParsedScore(user_id=msg.author.id, username=msg.author.display_name,
-                           day=day, score=None, solved=False)
-    return ParsedScore(user_id=msg.author.id, username=msg.author.display_name,
-                       day=day, score=int(s), solved=True)
+def _extract_day_from_message(msg: discord.Message) -> Optional[int]:
+    # 1) Try plain text
+    m = DAY_RE_TEXT.search(msg.content or "")
+    if m:
+        return int(m.group("day"))
+    # 2) Look inside embeds (title/description)
+    for emb in msg.embeds:
+        if emb.title:
+            m = DAY_RE_TEXT.search(emb.title)
+            if m:
+                return int(m.group("day"))
+        if emb.description:
+            m = DAY_RE_TEXT.search(emb.description)
+            if m:
+                return int(m.group("day"))
+    return None
 
-def parse_bot_summary(msg: discord.Message) -> List[ParsedScore]:
-    day_guess = None
-    mday = re.search(r"\bWordle\s+(?P<day>\d+)\b", msg.content, re.IGNORECASE)
-    if mday:
-        day_guess = int(mday.group("day"))
-    results = []
-    for line in msg.content.splitlines():
-        m = BOT_LINE_RE.search(line)
+def parse_group_summary_style(msg: discord.Message) -> List[ParsedScore]:
+    """Parses the '2/6: @A @B' multi-mention lines and returns scores."""
+    day = _extract_day_from_message(msg)
+    if day is None:
+        return []
+
+    results: List[ParsedScore] = []
+    lines = (msg.content or "").splitlines()
+    if not lines:
+        return []
+
+    # For each line like "3/6: <mentions...>"
+    for line in lines:
+        line = line.strip()
+        m = SCORE_LINE_RE.match(line)
         if not m:
             continue
-        who = m.group("who").strip()
-        s = m.group("score")
-        score = None if s.lower() == "x" else int(s)
-        solved = (score is not None)
-        user_id = None
-        username = who
-        mid = re.match(r"<@!?(?P<id>\d+)>", who)
-        if mid:
-            user_id = int(mid.group("id"))
-        if day_guess is None:
-            continue
-        results.append(ParsedScore(user_id=user_id, username=username, day=day_guess,
-                                   score=score, solved=solved))
+
+        raw_score = m.group("score")
+        score_val = None if raw_score.lower() == "x" else int(raw_score)
+        solved = score_val is not None
+
+        # Grab mention IDs present in this line
+        ids_in_line = [int(mid.group("id")) for mid in re.finditer(r"<@!?(?P<id>\d+)>", line)]
+        if ids_in_line:
+            # Map mention ids -> Member objects if available in message.mentions
+            id_to_member = {m.id: m for m in msg.mentions}
+            for uid in ids_in_line:
+                member = id_to_member.get(uid)
+                username = member.display_name if member else f"user:{uid}"
+                results.append(ParsedScore(user_id=uid, username=username, day=day,
+                                           score=score_val, solved=solved))
+        else:
+            # Fallback: if the bot used plain @Name text (no actual mentions)
+            # split words and pick tokens starting with '@'
+            tokens = [t for t in m.group("rest").split() if t.startswith("@")]
+            for name in tokens:
+                # store without id; we still keep a row using 0 as user_id
+                username = name.lstrip("@")
+                results.append(ParsedScore(user_id=0, username=username, day=day,
+                                           score=score_val, solved=solved))
     return results
 
+# ---- Scope helper -----------------------------------------------------------
 def message_in_scope(msg: discord.Message) -> bool:
     return (not WORDLE_CHANNEL_ID) or (msg.channel.id == WORDLE_CHANNEL_ID)
 
@@ -183,37 +202,35 @@ async def on_ready():
 
 @bot.event
 async def on_message(message: discord.Message):
-    # Avoid own messages
+    # Ignore our own messages
     if bot.user and message.author.id == bot.user.id:
         return
     if not message_in_scope(message):
         return
 
-    # Parse Wordle bot summaries (if configured)
-    if WORDLE_BOT_ID and message.author.id == WORDLE_BOT_ID:
-        try:
-            parsed_list = parse_bot_summary(message)
-            for p in parsed_list:
-                if p.day is None:
-                    continue
-                # best-effort mention → id mapping
-                if p.user_id is None and message.mentions:
-                    for m in message.mentions:
-                        if m.display_name == p.username or m.mention in message.content:
-                            p.user_id = m.id
-                            p.username = m.display_name
-                            break
-                upsert_score(p.user_id or 0, p.username, p.day, p.score, p.solved)
-        except Exception:
-            print("Error parsing bot summary:")
-            traceback.print_exc()
-        return
-
-    # Parse human shares
+    # Parse your Wordle bot's group summary
+    # (Prefer setting WORDLE_BOT_ID to that bot's numeric ID)
     try:
-        p = parse_human_share(message)
-        if p:
-            upsert_score(p.user_id or 0, p.username, p.day, p.score, p.solved)
+        if (WORDLE_BOT_ID and message.author.id == WORDLE_BOT_ID) or \
+           (not WORDLE_BOT_ID and message.author.bot):
+            parsed = parse_group_summary_style(message)
+            for p in parsed:
+                upsert_score(p.user_id or 0, p.username, p.day, p.score, p.solved)
+            # Don't return here; we still want to catch human shares below if present
+    except Exception:
+        print("Error parsing group summary:")
+        traceback.print_exc()
+
+    # Also capture human shares like "Wordle 1558 3/6" if people post them
+    try:
+        m = re.search(r"\bWordle\s+(?P<day>\d+)\s+(?P<score>[Xx]|\d)\/6\b",
+                      message.content or "", re.IGNORECASE)
+        if m:
+            day = int(m.group("day"))
+            s = m.group("score")
+            score_val = None if s.lower() == "x" else int(s)
+            upsert_score(message.author.id, message.author.display_name, day,
+                         score_val, score_val is not None)
     except Exception:
         print("Error parsing human share:")
         traceback.print_exc()
@@ -237,17 +254,14 @@ async def on_app_command_error(interaction: discord.Interaction, error: Exceptio
 # ---- Slash Commands ---------------------------------------------------------
 @tree.command(description="Ping (quick test)")
 async def ping(interaction: discord.Interaction):
-    # ACKNOWLEDGE ASAP
     if not interaction.response.is_done():
         await interaction.response.send_message("Pong!", ephemeral=True)
 
 @tree.command(description="Show leaderboard over recent days (default 30).")
 @app_commands.describe(days="How many recent days to include (default 30).")
 async def leaderboard(interaction: discord.Interaction, days: Optional[int] = 30):
-    # ACK ASAP
     if not interaction.response.is_done():
         await interaction.response.defer(thinking=True, ephemeral=True)
-
     try:
         rows = fetch_leaderboard(days_back=days or 30)
         if not rows:
@@ -272,14 +286,13 @@ async def plot(interaction: discord.Interaction, user: Optional[discord.Member] 
                days: Optional[int] = 30):
     if not interaction.response.is_done():
         await interaction.response.defer(thinking=True, ephemeral=True)
-
     try:
         rows = fetch_scores(days_back=days or 30, user_id=user.id if user else None)
         if not rows:
             await interaction.followup.send("No scores found for that selection.", ephemeral=True)
             return
 
-        # Group by user
+        # group -> series
         series = {}
         for uid, uname, day, score, solved, _ in rows:
             series.setdefault((uid, uname), []).append((day, 7 if solved == 0 else score))
@@ -289,24 +302,18 @@ async def plot(interaction: discord.Interaction, user: Optional[discord.Member] 
             pts.sort(key=lambda t: t[0])
             xs = [d for d, _ in pts]
             ys = [y for _, y in pts]
-            label = f"{uname or uid}"
-            plt.plot(xs, ys, marker="o", label=label)
-
+            plt.plot(xs, ys, marker="o", label=f"{uname or uid}")
         plt.gca().invert_yaxis()
         plt.xlabel("Wordle Day #")
         plt.ylabel("Guesses (X shown as 7)")
-        title = f"Wordle scores — last {days} day(s)"
-        if user:
-            title += f" — {user.display_name}"
-        plt.title(title)
+        plt.title(f"Wordle scores — last {days} day(s)" + (f" — {user.display_name}" if user else ""))
         plt.legend()
         plt.tight_layout()
 
         buf = io.BytesIO()
         plt.savefig(buf, format="png", dpi=180)
         buf.seek(0)
-        file = discord.File(buf, filename="wordle_scores.png")
-        await interaction.followup.send(file=file, ephemeral=True)
+        await interaction.followup.send(file=discord.File(buf, "wordle_scores.png"), ephemeral=True)
         plt.close()
     except Exception:
         traceback.print_exc()
@@ -319,7 +326,6 @@ async def stats(interaction: discord.Interaction, user: Optional[discord.Member]
                 days: Optional[int] = 30):
     if not interaction.response.is_done():
         await interaction.response.defer(thinking=True, ephemeral=True)
-
     try:
         rows = fetch_scores(days_back=days or 30, user_id=user.id if user else None)
         if not rows:
@@ -338,7 +344,6 @@ async def stats(interaction: discord.Interaction, user: Optional[discord.Member]
             games = len(scores)
             name = f"<@{uid}>" if uid else (uname or "Unknown")
             if solved_scores:
-                from statistics import mean, median
                 lines.append(
                     f"• {name}: games {games}, solves {len(solved_scores)}, X {misses}, "
                     f"avg {mean(solved_scores):.2f}, median {median(solved_scores):.2f}"
@@ -355,7 +360,6 @@ async def stats(interaction: discord.Interaction, user: Optional[discord.Member]
 async def rescan(interaction: discord.Interaction, limit: Optional[int] = 500):
     if not interaction.response.is_done():
         await interaction.response.defer(thinking=True, ephemeral=True)
-
     try:
         channel = interaction.channel
         if not isinstance(channel, (discord.TextChannel, discord.Thread)):
@@ -369,18 +373,23 @@ async def rescan(interaction: discord.Interaction, limit: Optional[int] = 500):
             if not message_in_scope(msg):
                 continue
 
-            if WORDLE_BOT_ID and msg.author.id == WORDLE_BOT_ID:
-                parsed_list = parse_bot_summary(msg)
-                for p in parsed_list:
-                    if p.day is None:
-                        continue
+            # Group summary messages
+            if (WORDLE_BOT_ID and msg.author.id == WORDLE_BOT_ID) or \
+               (not WORDLE_BOT_ID and msg.author.bot):
+                for p in parse_group_summary_style(msg):
                     upsert_score(p.user_id or 0, p.username, p.day, p.score, p.solved)
                     parsed += 1
                 continue
 
-            p = parse_human_share(msg)
-            if p:
-                upsert_score(p.user_id or 0, p.username, p.day, p.score, p.solved)
+            # Human shares
+            m = re.search(r"\bWordle\s+(?P<day>\d+)\s+(?P<score>[Xx]|\d)\/6\b",
+                          msg.content or "", re.IGNORECASE)
+            if m:
+                day = int(m.group("day"))
+                s = m.group("score")
+                score_val = None if s.lower() == "x" else int(s)
+                upsert_score(msg.author.id, msg.author.display_name, day,
+                             score_val, score_val is not None)
                 parsed += 1
 
         await interaction.followup.send(f"Rescan complete. Parsed {parsed} entries.", ephemeral=True)
