@@ -1,0 +1,20 @@
+# Secrets / local env
+.env
+
+# Local db / files
+*.db
+*.sqlite
+*.sqlite3
+
+# Python cruft
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Virtual env
+.venv/
+venv/
+
+# OS files
+.DS_Store
+Thumbs.db
