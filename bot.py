@@ -1,5 +1,5 @@
 from __future__ import annotations
-
+import unicodedata
 import os, io, re, sys, sqlite3, datetime as dt, traceback
 from dataclasses import dataclass
 from typing import Optional, List, Tuple, Dict
@@ -167,11 +167,22 @@ def fetch_leaderboard(days_back: Optional[int] = None, min_games: int = 5) -> Li
 
 # ========= Identity & alias helpers =========
 def normalize_username(s: str) -> str:
-    """Lower-case, strip spaces & leading '@' for consistent grouping."""
-    s = (s or "").strip()
+    """
+    Normalize a display name for matching/aliasing:
+    - NFKC normalize (unicode)
+    - strip leading '@', trim
+    - lowercase
+    - remove all non-alphanumeric chars (spaces, punctuation, emoji)
+    """
+    s = unicodedata.normalize("NFKC", s or "")
+    s = s.strip()
     if s.startswith("@"):
         s = s[1:]
-    return s.strip().lower()
+    s = s.lower()
+    # keep only a-z and 0-9
+    s = "".join(ch for ch in s if ch.isalnum())
+    return s
+
 
 def alias_lookup(name: str) -> int:
     """Return mapped user_id for a normalized display name if one exists; else 0."""
