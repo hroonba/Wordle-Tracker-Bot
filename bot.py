@@ -75,52 +75,47 @@ def upsert_score(user_id: int, username: str, day: int, score: Optional[int], so
         )
 
 def fetch_scores(days_back: int, user_id: Optional[int] = None) -> List[Tuple]:
+    """
+    Return rows in the last `days_back` days, using ts (ISO-8601) so it works
+    for both real Wordle numbers and inferred YYYYMMDD day-keys.
+    """
+    cutoff = (dt.datetime.utcnow() - dt.timedelta(days=(days_back or 30) - 1)).isoformat()
     with sqlite3.connect(DB_PATH) as con:
-        row = con.execute("SELECT MAX(day) FROM scores;").fetchone()
-        max_day = row[0] if row and row[0] is not None else 0
-        min_day = max(0, max_day - (days_back or 30) + 1)
         if user_id:
-            cur = con.execute(
-                """
+            cur = con.execute("""
                 SELECT user_id, username, day, score, solved, ts
                   FROM scores
-                 WHERE day BETWEEN ? AND ? AND user_id = ?
-                 ORDER BY day ASC;
-                """,
-                (min_day, max_day, user_id),
-            )
+                 WHERE ts >= ? AND user_id = ?
+                 ORDER BY user_id, ts ASC;
+            """, (cutoff, user_id))
         else:
-            cur = con.execute(
-                """
+            cur = con.execute("""
                 SELECT user_id, username, day, score, solved, ts
                   FROM scores
-                 WHERE day BETWEEN ? AND ?
-                 ORDER BY user_id, day ASC;
-                """,
-                (min_day, max_day),
-            )
+                 WHERE ts >= ?
+                 ORDER BY user_id, ts ASC;
+            """, (cutoff,))
         return list(cur.fetchall())
 
 def fetch_leaderboard(days_back: int, min_games: int = 5) -> List[Tuple]:
+    """
+    Aggregate over the last `days_back` days via ts cutoff.
+    X is treated as 7 for averages.
+    """
+    cutoff = (dt.datetime.utcnow() - dt.timedelta(days=(days_back or 30) - 1)).isoformat()
     with sqlite3.connect(DB_PATH) as con:
-        row = con.execute("SELECT MAX(day) FROM scores;").fetchone()
-        max_day = row[0] if row and row[0] is not None else 0
-        min_day = max(0, max_day - (days_back or 30) + 1)
-        cur = con.execute(
-            """
+        cur = con.execute("""
             SELECT user_id, MAX(username),
                    AVG(CASE WHEN solved=1 THEN score ELSE 7 END) AS avg_score,
                    SUM(CASE WHEN solved=1 THEN 1 ELSE 0 END) AS solves,
                    SUM(CASE WHEN solved=0 THEN 1 ELSE 0 END) AS misses,
                    COUNT(*) AS games
               FROM scores
-             WHERE day BETWEEN ? AND ?
+             WHERE ts >= ?
              GROUP BY user_id
             HAVING games >= ?
              ORDER BY avg_score ASC, solves DESC;
-            """,
-            (min_day, max_day, min_games),
-        )
+        """, (cutoff, min_games))
         return list(cur.fetchall())
 
 
@@ -155,9 +150,20 @@ def _extract_day_from_message(msg: discord.Message) -> Optional[int]:
     return None
 
 def parse_group_summary_style(msg: discord.Message) -> List[ParsedScore]:
+    """
+    Parses lines like:
+      '👑 2/6: @Where Jon Al Gaib'
+      '3/6: <@2866> <@1296> <@2680> <@3827>'
+      '4/6: <@1486>'
+    If the Wordle number isn't present, we infer "yesterday" and encode it as YYYYMMDD.
+    """
     day = _extract_day_from_message(msg)
     if day is None:
-        return []
+        # Infer yesterday's date in UTC, encode as YYYYMMDD (e.g., 20250925)
+        # This becomes our 'day' key for storage/uniqueness.
+        utc_dt = msg.created_at  # discord.py gives this in UTC
+        puzzle_date = (utc_dt - dt.timedelta(days=1)).date()
+        day = puzzle_date.year * 10000 + puzzle_date.month * 100 + puzzle_date.day
 
     results: List[ParsedScore] = []
     for raw in (msg.content or "").splitlines():
@@ -171,7 +177,7 @@ def parse_group_summary_style(msg: discord.Message) -> List[ParsedScore]:
         score_val = None if raw_score.lower() == "x" else int(raw_score)
         solved = score_val is not None
 
-        # Prefer actual mentions first
+        # Prefer actual mentions
         mention_ids = [int(mm.group("id")) for mm in re.finditer(r"<@!?(?P<id>\d+)>", rest)]
         if mention_ids:
             id_to_member = {mem.id: mem for mem in msg.mentions}
@@ -182,7 +188,7 @@ def parse_group_summary_style(msg: discord.Message) -> List[ParsedScore]:
                                            score=score_val, solved=solved))
             continue
 
-        # Fallback: treat the entire tail as one spaced display name like '@Where Jon Al Gaib'
+        # Fallback: entire remainder is a spaced display name like '@Where Jon Al Gaib'
         username = rest
         if username.startswith("**") and username.endswith("**"):
             username = username[2:-2].strip()
@@ -192,6 +198,7 @@ def parse_group_summary_style(msg: discord.Message) -> List[ParsedScore]:
             results.append(ParsedScore(user_id=0, username=username, day=day,
                                        score=score_val, solved=solved))
     return results
+
 
 def message_in_scope(msg: discord.Message) -> bool:
     return (not WORDLE_CHANNEL_ID) or (msg.channel.id == WORDLE_CHANNEL_ID)
