@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import os, io, re, sqlite3, datetime as dt, traceback, unicodedata
+import os, io, re, sqlite3, datetime as dt, traceback, unicodedata, difflib
 from dataclasses import dataclass
 from typing import Optional, List, Tuple, Dict
 
@@ -340,6 +340,78 @@ def detect_names_in_free_text(guild: discord.Guild | None, text: str) -> list[tu
 
     return hits
 
+# ========== NEW: Fuzzy match for '@' segments ==========
+def best_match_member_or_alias(guild: discord.Guild | None, raw_name: str, ratio_threshold: float = 0.78) -> tuple[int, str]:
+    """
+    Given a raw name fragment (from an '@' segment), return (user_id, display_name)
+    using normalized exact and fuzzy matching over:
+      - guild member display names
+      - guild member global names
+      - alias table
+    """
+    cleaned = raw_name.strip()
+    # Keep letters, digits, spaces, apostrophes; drop other punctuation/emojis
+    cleaned = re.sub(r"[^A-Za-z0-9' ]+", " ", cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    if not cleaned:
+        return 0, raw_name
+
+    target_norm = normalize_username(cleaned)
+    best = (0.0, 0, raw_name)  # (score, user_id, label)
+
+    # Candidates: members
+    if guild:
+        for m in guild.members:
+            for candidate, label in (
+                (m.display_name, m.display_name),
+                (getattr(m, "global_name", "") or "", m.display_name),
+            ):
+                if not candidate:
+                    continue
+                cand_norm = normalize_username(candidate)
+                if not cand_norm:
+                    continue
+                # exact first
+                if cand_norm == target_norm:
+                    return m.id, label
+                # fuzzy
+                score = difflib.SequenceMatcher(None, cand_norm, target_norm).ratio()
+                if score > best[0]:
+                    best = (score, m.id, label)
+
+    # Candidates: aliases
+    try:
+        with sqlite3.connect(DB_PATH) as con:
+            for name_norm, uid in con.execute("SELECT name_norm, user_id FROM aliases;"):
+                if not name_norm:
+                    continue
+                if name_norm == target_norm:
+                    # Try to pretty label
+                    label = None
+                    if guild:
+                        gm = guild.get_member(uid)
+                        if gm and gm.display_name:
+                            label = gm.display_name
+                    return uid, (label or cleaned)
+                score = difflib.SequenceMatcher(None, name_norm, target_norm).ratio()
+                if score > best[0]:
+                    # Pretty label if possible
+                    label = cleaned
+                    if guild:
+                        gm = guild.get_member(uid)
+                        if gm and gm.display_name:
+                            label = gm.display_name
+                    best = (score, uid, label)
+    except Exception:
+        traceback.print_exc()
+
+    # Accept best fuzzy match if strong enough
+    if best[1] and best[0] >= ratio_threshold:
+        return best[1], best[2]
+
+    # Nothing solid: return unresolved
+    return 0, cleaned
+
 
 # ========= Data model & parsing =========
 @dataclass
@@ -371,7 +443,8 @@ def parse_group_summary_style(msg: discord.Message) -> List[ParsedScore]:
     Supports lines like:
       '👑 2/6: @Name'
       '5/6: <@123> <@456> ...'
-      '4/6: Name One Name Two' (no @, no real mentions)
+      '4/6: @Name One @Name Two'  (plain text with '@' but no real mentions)
+      '3/6: Name One Name Two'    (no '@', no mentions)
     If Wordle number missing, infer "yesterday UTC" as YYYYMMDD.
     """
     day = _extract_day_from_message(msg)
@@ -401,22 +474,23 @@ def parse_group_summary_style(msg: discord.Message) -> List[ParsedScore]:
                 out.append(ParsedScore(user_id=uid, username=username, day=day, score=score_val, solved=solved))
             continue
 
-        # 2) '@Display Name' tokens
+        # 2) Plain-text '@' segments (NEW robust path)
         if "@" in rest:
-            names = [t.strip() for t in rest.split("@") if t.strip()]
-            for name in names:
-                uid, display = resolve_name_to_member(msg.guild, name)
+            # Split on '@' and ignore empties; each piece is a candidate name up to the next '@'
+            segs = [s.strip() for s in rest.split("@") if s.strip()]
+            for seg in segs:
+                uid, label = best_match_member_or_alias(msg.guild, seg)
+                out.append(ParsedScore(user_id=uid, username=label, day=day, score=score_val, solved=solved))
+            continue
+
+        # 3) No '@' at all — scan free text (fallback)
+        detected = detect_names_in_free_text(msg.guild, rest)
+        if detected:
+            for uid, display in detected:
                 out.append(ParsedScore(user_id=uid, username=display, day=day, score=score_val, solved=solved))
         else:
-            # 3) NEW: No '@' at all — scan free text for member names and aliases
-            detected = detect_names_in_free_text(msg.guild, rest)
-            if detected:
-                for uid, display in detected:
-                    out.append(ParsedScore(user_id=uid, username=display, day=day, score=score_val, solved=solved))
-            else:
-                # Fallback: treat the whole chunk as a single name
-                uid, display = resolve_name_to_member(msg.guild, rest)
-                out.append(ParsedScore(user_id=uid, username=display, day=day, score=score_val, solved=solved))
+            uid, display = resolve_name_to_member(msg.guild, rest)
+            out.append(ParsedScore(user_id=uid, username=display, day=day, score=score_val, solved=solved))
 
     return out
 
