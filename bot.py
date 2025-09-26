@@ -135,7 +135,7 @@ def fetch_scores(days_back: Optional[int] = None, user_id: Optional[int] = None)
                 """, (cutoff,))
         return list(cur.fetchall())
 
-def fetch_leaderboard(days_back: Optional[int] = None, min_games: int = 5) -> List[Tuple]:
+def fetch_leaderboard(days_back: Optional[int] = None, min_games: int = 25) -> List[Tuple]:
     with sqlite3.connect(DB_PATH) as con:
         if days_back is None:
             rows = list(con.execute("""
@@ -295,6 +295,51 @@ def resolve_name_to_member(guild: discord.Guild | None, name: str) -> tuple[int,
         return mapped, name
     return 0, name
 
+def detect_names_in_free_text(guild: discord.Guild | None, text: str) -> list[tuple[int, str]]:
+    """
+    Fallback extractor for lines with no real mentions and no '@'.
+    Scans the text and returns unique (user_id, display_name) hits for:
+      - guild member display names
+      - alias names from the aliases table
+    Matching uses normalized strings (letters+digits only).
+    """
+    hits: list[tuple[int, str]] = []
+    if not text:
+        return hits
+
+    target = normalize_username(text)
+    seen_ids: set[int] = set()
+
+    # Guild members
+    if guild:
+        for m in guild.members:
+            nm = normalize_username(m.display_name)
+            if nm and nm in target and m.id not in seen_ids:
+                hits.append((m.id, m.display_name))
+                seen_ids.add(m.id)
+                continue
+            gn = normalize_username(getattr(m, "global_name", "") or "")
+            if gn and gn in target and m.id not in seen_ids:
+                hits.append((m.id, m.display_name))
+                seen_ids.add(m.id)
+
+    # Aliases
+    try:
+        with sqlite3.connect(DB_PATH) as con:
+            for name_norm, uid in con.execute("SELECT name_norm, user_id FROM aliases;"):
+                if name_norm and name_norm in target and uid not in seen_ids:
+                    label = None
+                    if guild:
+                        gm = guild.get_member(uid)
+                        if gm and gm.display_name:
+                            label = gm.display_name
+                    hits.append((uid, label or f"user:{uid}"))
+                    seen_ids.add(uid)
+    except Exception:
+        traceback.print_exc()
+
+    return hits
+
 
 # ========= Data model & parsing =========
 @dataclass
@@ -325,8 +370,8 @@ def parse_group_summary_style(msg: discord.Message) -> List[ParsedScore]:
     """
     Supports lines like:
       '👑 2/6: @Name'
-      '3/6: <@123> <@456> ...'
-      '4/6: @Name One @Name Two'  (no real mentions)
+      '5/6: <@123> <@456> ...'
+      '4/6: Name One Name Two' (no @, no real mentions)
     If Wordle number missing, infer "yesterday UTC" as YYYYMMDD.
     """
     day = _extract_day_from_message(msg)
@@ -346,7 +391,7 @@ def parse_group_summary_style(msg: discord.Message) -> List[ParsedScore]:
         score_val = None if raw_score.lower() == "x" else int(raw_score)
         solved = score_val is not None
 
-        # Real mentions first
+        # 1) Real mentions
         mention_ids = [int(mm.group("id")) for mm in re.finditer(r"<@!?(?P<id>\d+)>", rest)]
         if mention_ids:
             id_to_member = {mem.id: mem for mem in msg.mentions}
@@ -356,11 +401,23 @@ def parse_group_summary_style(msg: discord.Message) -> List[ParsedScore]:
                 out.append(ParsedScore(user_id=uid, username=username, day=day, score=score_val, solved=solved))
             continue
 
-        # Multiple plain @Display Name tokens
-        names = [t.strip() for t in rest.split("@") if t.strip()] if "@" in rest else [rest]
-        for name in names:
-            uid, display = resolve_name_to_member(msg.guild, name)
-            out.append(ParsedScore(user_id=uid, username=display, day=day, score=score_val, solved=solved))
+        # 2) '@Display Name' tokens
+        if "@" in rest:
+            names = [t.strip() for t in rest.split("@") if t.strip()]
+            for name in names:
+                uid, display = resolve_name_to_member(msg.guild, name)
+                out.append(ParsedScore(user_id=uid, username=display, day=day, score=score_val, solved=solved))
+        else:
+            # 3) NEW: No '@' at all — scan free text for member names and aliases
+            detected = detect_names_in_free_text(msg.guild, rest)
+            if detected:
+                for uid, display in detected:
+                    out.append(ParsedScore(user_id=uid, username=display, day=day, score=score_val, solved=solved))
+            else:
+                # Fallback: treat the whole chunk as a single name
+                uid, display = resolve_name_to_member(msg.guild, rest)
+                out.append(ParsedScore(user_id=uid, username=display, day=day, score=score_val, solved=solved))
+
     return out
 
 def message_in_scope(msg: discord.Message) -> bool:
@@ -531,7 +588,6 @@ async def sync(interaction: discord.Interaction, scope: Optional[str] = "guild")
             if not interaction.guild:
                 await interaction.followup.send("Run in a server.", ephemeral=True)
                 return
-            # Copy global-defined commands into guild scope and sync
             guild_obj = discord.Object(id=interaction.guild_id)
             tree.copy_global_to(guild=guild_obj)
             out = await tree.sync(guild=guild_obj)
@@ -546,18 +602,15 @@ async def sync(interaction: discord.Interaction, scope: Optional[str] = "guild")
                 await interaction.followup.send("Run in a server.", ephemeral=True)
                 return
             guild_obj = discord.Object(id=interaction.guild_id)
-            # Clear guild commands on Discord by syncing an empty set
             tree.clear_commands(guild=guild_obj)
             await tree.sync(guild=guild_obj)
-            # Re-publish current set into guild
             tree.copy_global_to(guild=guild_obj)
             out = await tree.sync(guild=guild_obj)
             await interaction.followup.send(f"Purged and re-synced guild commands ({len(out)}).", ephemeral=True)
 
         elif scope == "purge_global":
-            # Clear ALL global commands from Discord
-            tree.clear_commands()  # clear global from our local tree
-            out = await tree.sync()  # pushes empty set to Discord
+            tree.clear_commands()  # clear global from local tree
+            await tree.sync()      # push empty set to Discord
             await interaction.followup.send("Purged all GLOBAL commands from Discord.", ephemeral=True)
 
         else:
@@ -634,7 +687,7 @@ async def leaderboard(interaction: discord.Interaction, days: Optional[int] = No
             await interaction.followup.send("No data yet.")
             return
         title = "entire history" if days is None else f"last {days} days"
-        lines = [f"**Leaderboard ({title})**\n_Min 5 games to rank_"]
+        lines = [f"**Leaderboard ({title})**\n_Min 25 games to rank_"]
         for rank, (_key, label, avg, solves, misses, games) in enumerate(rows, 1):
             lines.append(f"#{rank} {label}: avg {avg:.2f} (solves {solves}, X {misses}, games {games})")
         await interaction.followup.send("\n".join(lines))  # public
