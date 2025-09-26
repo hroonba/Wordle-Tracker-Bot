@@ -33,7 +33,7 @@ MAX_BACKFILL = int(os.getenv("MAX_BACKFILL") or "1500")
 
 INTENTS = discord.Intents.default()
 INTENTS.message_content = True
-INTENTS.members = True  # required for nickname resolution
+INTENTS.members = True  # we rely on member lists for name matching
 
 
 # ========= DB =========
@@ -129,9 +129,9 @@ def fetch_scores(days_back: Optional[int] = None, user_id: Optional[int] = None)
             else:
                 cur = con.execute("""
                     SELECT user_id, username, day, score, solved, ts
-                      FROM scores
-                     WHERE ts >= ?
-                     ORDER BY user_id, ts ASC;
+                     FROM scores
+                    WHERE ts >= ?
+                    ORDER BY user_id, ts ASC;
                 """, (cutoff,))
         return list(cur.fetchall())
 
@@ -270,23 +270,59 @@ def label_plain_for_hist(guild: discord.Guild | None, user_id: int, username: st
         return username or f"user:{mapped}"
     return username or "Unknown"
 
+
+# ========= Member index (for robust matching) =========
+# { guild_id: { normalized_name: (user_id, display_name) } }
+MEMBER_INDEX: Dict[int, Dict[str, Tuple[int, str]]] = {}
+
+async def build_member_index(guild: discord.Guild):
+    """Fetch and index all members so fuzzy-matching has complete data."""
+    # Ensure we have the full list (requires Server Members Intent enabled in the bot portal)
+    try:
+        async for _ in guild.fetch_members(limit=None):
+            pass
+    except Exception:
+        # If fetch fails, we’ll still index whatever is cached
+        traceback.print_exc()
+
+    index: Dict[str, Tuple[int, str]] = {}
+    for m in guild.members:
+        label = m.display_name or (getattr(m, "global_name", "") or m.name)
+        norm = normalize_username(label)
+        if norm:
+            index[norm] = (m.id, label)
+        # Also index global_name as an alternate key
+        gn = getattr(m, "global_name", "") or ""
+        if gn:
+            norm_gn = normalize_username(gn)
+            if norm_gn and norm_gn not in index:
+                index[norm_gn] = (m.id, label)
+    MEMBER_INDEX[guild.id] = index
+
+def member_index_lookup(guild: discord.Guild | None, norm: str) -> Optional[Tuple[int, str]]:
+    if not guild or guild.id not in MEMBER_INDEX:
+        return None
+    return MEMBER_INDEX[guild.id].get(norm)
+
+
+# ========= Matching helpers =========
 def resolve_name_to_member(guild: discord.Guild | None, name: str) -> tuple[int, str]:
-    """
-    Resolve a plain '@Display Name' to (user_id, display_name) using guild members.
-    If not found, return (0, original_name). Alias mapping will also catch it later.
-    """
+    """Resolve a plain name to (user_id, display_name) via index, guild lists, or alias."""
     if not guild:
         return 0, name
     target = normalize_username(name)
-    # Match by current server display name
+
+    hit = member_index_lookup(guild, target)
+    if hit:
+        return hit
+
+    # Fallback: iterate members if index missing
     for m in guild.members:
         if normalize_username(m.display_name) == target:
             return m.id, m.display_name
-    # Match by global name (if any)
-    for m in guild.members:
         if normalize_username(getattr(m, "global_name", "") or "") == target:
             return m.id, m.display_name
-    # Try aliases table
+
     mapped = alias_lookup(name)
     if mapped:
         m = guild.get_member(mapped)
@@ -298,32 +334,21 @@ def resolve_name_to_member(guild: discord.Guild | None, name: str) -> tuple[int,
 def detect_names_in_free_text(guild: discord.Guild | None, text: str) -> list[tuple[int, str]]:
     """
     Fallback extractor for lines with no real mentions and no '@'.
-    Scans the text and returns unique (user_id, display_name) hits for:
-      - guild member display names
-      - alias names from the aliases table
-    Matching uses normalized strings (letters+digits only).
+    Scans text and returns unique (user_id, display_name) hits for:
+      - guild member display names (via MEMBER_INDEX)
+      - alias names
     """
     hits: list[tuple[int, str]] = []
     if not text:
         return hits
-
     target = normalize_username(text)
     seen_ids: set[int] = set()
 
-    # Guild members
-    if guild:
-        for m in guild.members:
-            nm = normalize_username(m.display_name)
-            if nm and nm in target and m.id not in seen_ids:
-                hits.append((m.id, m.display_name))
-                seen_ids.add(m.id)
-                continue
-            gn = normalize_username(getattr(m, "global_name", "") or "")
-            if gn and gn in target and m.id not in seen_ids:
-                hits.append((m.id, m.display_name))
-                seen_ids.add(m.id)
+    if guild and guild.id in MEMBER_INDEX:
+        for norm, (uid, label) in MEMBER_INDEX[guild.id].items():
+            if norm and norm in target and uid not in seen_ids:
+                hits.append((uid, label)); seen_ids.add(uid)
 
-    # Aliases
     try:
         with sqlite3.connect(DB_PATH) as con:
             for name_norm, uid in con.execute("SELECT name_norm, user_id FROM aliases;"):
@@ -333,83 +358,68 @@ def detect_names_in_free_text(guild: discord.Guild | None, text: str) -> list[tu
                         gm = guild.get_member(uid)
                         if gm and gm.display_name:
                             label = gm.display_name
-                    hits.append((uid, label or f"user:{uid}"))
-                    seen_ids.add(uid)
+                    hits.append((uid, label or f"user:{uid}")); seen_ids.add(uid)
     except Exception:
         traceback.print_exc()
-
     return hits
 
-# ========== NEW: Fuzzy match for '@' segments ==========
-def best_match_member_or_alias(guild: discord.Guild | None, raw_name: str, ratio_threshold: float = 0.78) -> tuple[int, str]:
+def best_match_member_or_alias(
+    guild: discord.Guild | None,
+    raw_name: str,
+    ratio_threshold: float = 0.72  # a bit lower; handles long/complex names better
+) -> tuple[int, str]:
     """
     Given a raw name fragment (from an '@' segment), return (user_id, display_name)
-    using normalized exact and fuzzy matching over:
-      - guild member display names
-      - guild member global names
-      - alias table
+    using normalized exact and fuzzy matching over the member index and alias table.
     """
     cleaned = raw_name.strip()
-    # Keep letters, digits, spaces, apostrophes; drop other punctuation/emojis
-    cleaned = re.sub(r"[^A-Za-z0-9' ]+", " ", cleaned)
+    # Permit letters, digits, spaces, apostrophes (straight/curly), hyphens, underscores
+    cleaned = re.sub(r"[^A-Za-z0-9'’ _-]+", " ", cleaned)
     cleaned = re.sub(r"\s+", " ", cleaned).strip()
     if not cleaned:
         return 0, raw_name
 
     target_norm = normalize_username(cleaned)
-    best = (0.0, 0, raw_name)  # (score, user_id, label)
+    # Exact via index
+    hit = member_index_lookup(guild, target_norm) if guild else None
+    if hit:
+        return hit
 
-    # Candidates: members
-    if guild:
-        for m in guild.members:
-            for candidate, label in (
-                (m.display_name, m.display_name),
-                (getattr(m, "global_name", "") or "", m.display_name),
-            ):
-                if not candidate:
-                    continue
-                cand_norm = normalize_username(candidate)
-                if not cand_norm:
-                    continue
-                # exact first
-                if cand_norm == target_norm:
-                    return m.id, label
-                # fuzzy
-                score = difflib.SequenceMatcher(None, cand_norm, target_norm).ratio()
-                if score > best[0]:
-                    best = (score, m.id, label)
+    best = (0.0, 0, cleaned)  # (score, user_id, label)
 
-    # Candidates: aliases
+    # Fuzzy vs member index
+    if guild and guild.id in MEMBER_INDEX:
+        for norm, (uid, label) in MEMBER_INDEX[guild.id].items():
+            score = difflib.SequenceMatcher(None, norm, target_norm).ratio()
+            if score > best[0]:
+                best = (score, uid, label)
+
+    # Exact/ fuzzy vs aliases
     try:
         with sqlite3.connect(DB_PATH) as con:
             for name_norm, uid in con.execute("SELECT name_norm, user_id FROM aliases;"):
                 if not name_norm:
                     continue
                 if name_norm == target_norm:
-                    # Try to pretty label
-                    label = None
+                    lab = None
                     if guild:
                         gm = guild.get_member(uid)
                         if gm and gm.display_name:
-                            label = gm.display_name
-                    return uid, (label or cleaned)
+                            lab = gm.display_name
+                    return uid, (lab or cleaned)
                 score = difflib.SequenceMatcher(None, name_norm, target_norm).ratio()
                 if score > best[0]:
-                    # Pretty label if possible
-                    label = cleaned
+                    lab = cleaned
                     if guild:
                         gm = guild.get_member(uid)
                         if gm and gm.display_name:
-                            label = gm.display_name
-                    best = (score, uid, label)
+                            lab = gm.display_name
+                    best = (score, uid, lab)
     except Exception:
         traceback.print_exc()
 
-    # Accept best fuzzy match if strong enough
     if best[1] and best[0] >= ratio_threshold:
         return best[1], best[2]
-
-    # Nothing solid: return unresolved
     return 0, cleaned
 
 
@@ -464,49 +474,35 @@ def parse_group_summary_style(msg: discord.Message) -> List[ParsedScore]:
         score_val = None if raw_score.lower() == "x" else int(raw_score)
         solved = score_val is not None
 
-        # 1) Real mentions
+        # 1) Real mentions — record them, strip them, and keep parsing leftovers
         mention_ids = [int(mm.group("id")) for mm in re.finditer(r"<@!?(?P<id>\d+)>", rest)]
         if mention_ids:
             id_to_member = {mem.id: mem for mem in msg.mentions}
-            # record all real mentions
             for uid in mention_ids:
                 member = id_to_member.get(uid)
                 username = member.display_name if member else f"user:{uid}"
                 out.append(ParsedScore(user_id=uid, username=username, day=day, score=score_val, solved=solved))
 
-            # NEW: remove the real-mention tokens and keep parsing what's left
-            rest_wo_mentions = re.sub(r"<@!?\d+>", " ", rest).strip()
-            rest_wo_mentions = re.sub(r"\s+", " ", rest_wo_mentions)
+            rest = re.sub(r"<@!?\d+>", " ", rest)
+            rest = re.sub(r"\s+", " ", rest).strip()
 
-            if rest_wo_mentions:
-                if "@" in rest_wo_mentions:
-                    # Plain-text '@' segments
-                    segs = [s.strip() for s in rest_wo_mentions.split("@") if s.strip()]
-                    for seg in segs:
-                        uid, label = best_match_member_or_alias(msg.guild, seg)
-                        out.append(ParsedScore(user_id=uid, username=label, day=day, score=score_val, solved=solved))
-                else:
-                    # Free-text fallback (names without '@')
-                    detected = detect_names_in_free_text(msg.guild, rest_wo_mentions)
-                    if detected:
-                        for uid, display in detected:
-                            out.append(ParsedScore(user_id=uid, username=display, day=day, score=score_val, solved=solved))
-                    else:
-                        uid, display = resolve_name_to_member(msg.guild, rest_wo_mentions)
-                        out.append(ParsedScore(user_id=uid, username=display, day=day, score=score_val, solved=solved))
-
-            # IMPORTANT: don't `continue` — we've already handled both mentions and the leftovers
+        # 2) Plain-text '@' segments
+        if "@" in rest:
+            segs = [s.strip() for s in rest.split("@") if s.strip()]
+            for seg in segs:
+                uid, label = best_match_member_or_alias(msg.guild, seg)
+                out.append(ParsedScore(user_id=uid, username=label, day=day, score=score_val, solved=solved))
             continue
 
-
-        # 3) No '@' at all — scan free text (fallback)
-        detected = detect_names_in_free_text(msg.guild, rest)
-        if detected:
-            for uid, display in detected:
+        # 3) No '@' left — free-text multi-name scan
+        if rest:
+            detected = detect_names_in_free_text(msg.guild, rest)
+            if detected:
+                for uid, display in detected:
+                    out.append(ParsedScore(user_id=uid, username=display, day=day, score=score_val, solved=solved))
+            else:
+                uid, display = resolve_name_to_member(msg.guild, rest)
                 out.append(ParsedScore(user_id=uid, username=display, day=day, score=score_val, solved=solved))
-        else:
-            uid, display = resolve_name_to_member(msg.guild, rest)
-            out.append(ParsedScore(user_id=uid, username=display, day=day, score=score_val, solved=solved))
 
     return out
 
@@ -519,9 +515,6 @@ bot = commands.Bot(command_prefix="!", intents=INTENTS)
 tree = bot.tree
 
 async def safe_defer(interaction: discord.Interaction, *, ephemeral: bool = True, thinking: bool = True) -> bool:
-    """
-    Default private. Public commands pass ephemeral=False.
-    """
     if interaction.response.is_done():
         return True
     try:
@@ -533,7 +526,6 @@ async def safe_defer(interaction: discord.Interaction, *, ephemeral: bool = True
     except Exception as e:
         print("safe_defer: unexpected error:", repr(e))
         return False
-
 
 async def do_rescan_channel(channel: discord.abc.Messageable, limit: int) -> int:
     """Scan channel history and ingest messages."""
@@ -562,16 +554,11 @@ async def do_rescan_channel(channel: discord.abc.Messageable, limit: int) -> int
     return parsed
 
 async def ensure_daily_backfill(interaction: discord.Interaction) -> None:
-    """
-    If we haven't backfilled yet today (UTC), run a rescan BEFORE producing
-    public outputs so data is up-to-date.
-    """
     today_ymd = dt.datetime.now(dt.timezone.utc).date().isoformat()
     last = kv_get("last_backfill_ymd")
     if last == today_ymd:
         return
 
-    # Choose channel: WORDLE_CHANNEL_ID preferred; else current channel
     channel: discord.abc.Messageable
     if WORDLE_CHANNEL_ID and interaction.guild:
         ch = interaction.guild.get_channel(WORDLE_CHANNEL_ID)
@@ -593,7 +580,6 @@ async def on_ready():
     init_aliases_db()
     try:
         if GUILD_ID:
-            # Register our global definitions as guild-local commands for faster updates
             guild_obj = discord.Object(id=int(GUILD_ID))
             tree.copy_global_to(guild=guild_obj)
             synced = await tree.sync(guild=guild_obj)
@@ -603,8 +589,37 @@ async def on_ready():
             print(f"Slash commands synced globally: {len(synced)}")
     except Exception as e:
         print("Slash sync error:", repr(e))
+
+    # Build member indexes for all guilds the bot is in
+    try:
+        for g in bot.guilds:
+            await build_member_index(g)
+            print(f"Indexed {len(MEMBER_INDEX.get(g.id, {}))} members for guild {g.id}")
+    except Exception:
+        traceback.print_exc()
+
     print(f"Logged in as {bot.user} (ID: {bot.user.id})")
 
+@bot.event
+async def on_guild_join(guild: discord.Guild):
+    await build_member_index(guild)
+
+@bot.event
+async def on_guild_available(guild: discord.Guild):
+    await build_member_index(guild)
+
+@bot.event
+async def on_member_update(before: discord.Member, after: discord.Member):
+    # Keep the index fresh if display names change
+    await build_member_index(after.guild)
+
+@bot.event
+async def on_member_join(member: discord.Member):
+    await build_member_index(member.guild)
+
+@bot.event
+async def on_member_remove(member: discord.Member):
+    await build_member_index(member.guild)
 
 @bot.event
 async def on_message(message: discord.Message):
@@ -655,7 +670,6 @@ async def on_app_command_error(interaction: discord.Interaction, error: Exceptio
 # ========= Slash commands =========
 @tree.command(description="Ping (quick test)")
 async def ping(interaction: discord.Interaction):
-    # Private (ephemeral) ping
     if not interaction.response.is_done():
         await interaction.response.send_message("Pong!", ephemeral=True)
 
@@ -670,7 +684,6 @@ async def sync(interaction: discord.Interaction, scope: Optional[str] = "guild")
 
     scope = (scope or "guild").lower()
 
-    # All sync ops are ephemeral
     if not await safe_defer(interaction, ephemeral=True):
         return
     try:
@@ -699,8 +712,8 @@ async def sync(interaction: discord.Interaction, scope: Optional[str] = "guild")
             await interaction.followup.send(f"Purged and re-synced guild commands ({len(out)}).", ephemeral=True)
 
         elif scope == "purge_global":
-            tree.clear_commands()  # clear global from local tree
-            await tree.sync()      # push empty set to Discord
+            tree.clear_commands()
+            await tree.sync()
             await interaction.followup.send("Purged all GLOBAL commands from Discord.", ephemeral=True)
 
         else:
@@ -767,7 +780,6 @@ async def alias_list_cmd(interaction: discord.Interaction):
 @tree.command(description="Show leaderboard for the entire history (or last N days).")
 @app_commands.describe(days="Optional: limit to last N days. Omit for entire history.")
 async def leaderboard(interaction: discord.Interaction, days: Optional[int] = None):
-    # Ensure up-to-date before public post
     await ensure_daily_backfill(interaction)
     if not await safe_defer(interaction, ephemeral=False):
         return
@@ -780,7 +792,7 @@ async def leaderboard(interaction: discord.Interaction, days: Optional[int] = No
         lines = [f"**Leaderboard ({title})**\n_Min 25 games to rank_"]
         for rank, (_key, label, avg, solves, misses, games) in enumerate(rows, 1):
             lines.append(f"#{rank} {label}: avg {avg:.2f} (solves {solves}, X {misses}, games {games})")
-        await interaction.followup.send("\n".join(lines))  # public
+        await interaction.followup.send("\n".join(lines))
     except Exception:
         traceback.print_exc()
         await interaction.followup.send("Error generating leaderboard.")
@@ -790,9 +802,8 @@ async def leaderboard(interaction: discord.Interaction, days: Optional[int] = No
 @app_commands.describe(days="Optional: limit to last N days (omit for entire history).",
                        top_n="Optional: show only top N users by average")
 async def plot_histogram(interaction: discord.Interaction, days: Optional[int] = None, top_n: Optional[int] = None):
-    # Ensure up-to-date before public post
     await ensure_daily_backfill(interaction)
-    if not await safe_defer(interaction, ephemeral=False): 
+    if not await safe_defer(interaction, ephemeral=False):
         return
     try:
         rows = fetch_scores(days_back=days)
@@ -800,7 +811,6 @@ async def plot_histogram(interaction: discord.Interaction, days: Optional[int] =
             await interaction.followup.send("No scores found.")
             return
 
-        # Aggregate per identity
         per_user: Dict[tuple, Dict] = {}
         for uid, uname, _day, score, solved, _ts in rows:
             key = identity_key(uid or 0, uname or "")
@@ -809,7 +819,6 @@ async def plot_histogram(interaction: discord.Interaction, days: Optional[int] =
             s = (score if solved == 1 else 7)
             entry["counts"][s] += 1
 
-        # Rank by average (X=7)
         ranked = []
         for key, d in per_user.items():
             flat = []
@@ -846,7 +855,7 @@ async def plot_histogram(interaction: discord.Interaction, days: Optional[int] =
         buf = io.BytesIO()
         plt.savefig(buf, format="png", dpi=180, bbox_inches="tight")
         buf.seek(0)
-        await interaction.followup.send(file=discord.File(buf, "hist.png"))  # public
+        await interaction.followup.send(file=discord.File(buf, "hist.png"))
         plt.close()
     except Exception:
         traceback.print_exc()
@@ -869,7 +878,6 @@ async def rescan(interaction: discord.Interaction, limit: Optional[int] = 500):
 
         parsed = await do_rescan_channel(channel, (limit or 500))
         await interaction.followup.send(f"Rescan complete. Parsed {parsed}.", ephemeral=True)
-        # Mark today's backfill done so /plot & /leaderboard won't re-run immediately
         kv_set("last_backfill_ymd", dt.datetime.now(dt.timezone.utc).date().isoformat())
     except Exception:
         traceback.print_exc()
