@@ -83,40 +83,64 @@ def upsert_score(user_id: int, username: str, day: int, score: Optional[int], so
             ),
         )
 
-def fetch_scores(days_back: int, user_id: Optional[int] = None) -> List[Tuple]:
-    """Return rows in the last N days using ts so it works for inferred days too."""
-    cutoff = (dt.datetime.utcnow() - dt.timedelta(days=(days_back or 30) - 1)).isoformat()
+def fetch_scores(days_back: Optional[int] = None, user_id: Optional[int] = None) -> List[Tuple]:
+    """
+    Return rows in the last `days_back` days using ts (ISO); if days_back is None,
+    return the entire history.
+    """
     with sqlite3.connect(DB_PATH) as con:
-        if user_id:
-            cur = con.execute("""
-                SELECT user_id, username, day, score, solved, ts
-                  FROM scores
-                 WHERE ts >= ? AND user_id = ?
-                 ORDER BY user_id, ts ASC;
-            """, (cutoff, user_id))
+        if days_back is None:
+            if user_id:
+                cur = con.execute("""
+                    SELECT user_id, username, day, score, solved, ts
+                      FROM scores
+                     WHERE user_id = ?
+                     ORDER BY user_id, ts ASC;
+                """, (user_id,))
+            else:
+                cur = con.execute("""
+                    SELECT user_id, username, day, score, solved, ts
+                      FROM scores
+                     ORDER BY user_id, ts ASC;
+                """)
         else:
-            cur = con.execute("""
-                SELECT user_id, username, day, score, solved, ts
-                  FROM scores
-                 WHERE ts >= ?
-                 ORDER BY user_id, ts ASC;
-            """, (cutoff,))
+            cutoff = (dt.datetime.utcnow() - dt.timedelta(days=(days_back or 1) - 1)).isoformat()
+            if user_id:
+                cur = con.execute("""
+                    SELECT user_id, username, day, score, solved, ts
+                      FROM scores
+                     WHERE ts >= ? AND user_id = ?
+                     ORDER BY user_id, ts ASC;
+                """, (cutoff, user_id))
+            else:
+                cur = con.execute("""
+                    SELECT user_id, username, day, score, solved, ts
+                      FROM scores
+                     WHERE ts >= ?
+                     ORDER BY user_id, ts ASC;
+                """, (cutoff,))
         return list(cur.fetchall())
 
-def fetch_leaderboard(days_back: int, min_games: int = 5) -> List[Tuple]:
+def fetch_leaderboard(days_back: Optional[int] = None, min_games: int = 5) -> List[Tuple]:
     """
-    Leaderboard over the last N days using Python-side grouping by identity,
-    so unknown-name rows merge correctly with known user IDs.
-    Returns: (key, label, avg, solves, misses, games)
+    Leaderboard over a time window (None => entire history) using Python-side
+    grouping by identity. Returns: (key, label, avg, solves, misses, games)
     """
-    cutoff = (dt.datetime.utcnow() - dt.timedelta(days=(days_back or 30) - 1)).isoformat()
     with sqlite3.connect(DB_PATH) as con:
-        rows = list(con.execute("""
-            SELECT user_id, username, score, solved, ts
-              FROM scores
-             WHERE ts >= ?
-             ORDER BY ts ASC;
-        """, (cutoff,)))
+        if days_back is None:
+            rows = list(con.execute("""
+                SELECT user_id, username, score, solved, ts
+                  FROM scores
+                 ORDER BY ts ASC;
+            """))
+        else:
+            cutoff = (dt.datetime.utcnow() - dt.timedelta(days=(days_back or 1) - 1)).isoformat()
+            rows = list(con.execute("""
+                SELECT user_id, username, score, solved, ts
+                  FROM scores
+                 WHERE ts >= ?
+                 ORDER BY ts ASC;
+            """, (cutoff,)))
 
     agg: Dict[tuple, Dict] = {}
     for uid, uname, score, solved, _ts in rows:
@@ -177,16 +201,14 @@ def alias_list() -> list[tuple[str,int]]:
 def apply_alias_to_history(name: str, user_id: int, display_name: str):
     """
     Retroactively migrate rows where user_id==0 and normalized username matches 'name'
-    to the provided user_id/display_name. Done row-by-row to avoid SQL function quirks.
+    to the provided user_id/display_name.
     """
     n = normalize_username(name)
     with sqlite3.connect(DB_PATH) as con:
         rows = list(con.execute("SELECT rowid, user_id, username, day, score, solved, ts FROM scores WHERE user_id = 0;"))
         for rowid, _u, un, day, score, solved, ts in rows:
             if normalize_username(un) == n:
-                # delete old rowid (unknown user)
                 con.execute("DELETE FROM scores WHERE rowid = ?;", (rowid,))
-                # upsert for the real user
                 con.execute("""
                     INSERT INTO scores (user_id, username, day, score, solved, ts)
                     VALUES (?, ?, ?, ?, ?, ?)
@@ -216,6 +238,27 @@ def identity_label(user_id: int, username: str) -> str:
         return f"<@{mapped}>"
     return username or "Unknown"
 
+def label_plain_for_hist(guild: discord.Guild | None, user_id: int, username: str) -> str:
+    """
+    A human-friendly label for plots: prefer a display name string (not a mention).
+    """
+    if user_id:
+        # Best effort: current display name if we can see the member
+        if guild:
+            m = guild.get_member(user_id)
+            if m and m.display_name:
+                return m.display_name
+        return username or f"user:{user_id}"
+    # If alias maps to an ID, try to resolve to a name
+    mapped = alias_lookup(username)
+    if mapped:
+        if guild:
+            m = guild.get_member(mapped)
+            if m and m.display_name:
+                return m.display_name
+        return username or f"user:{mapped}"
+    return username or "Unknown"
+
 def resolve_name_to_member(guild: discord.Guild | None, name: str) -> tuple[int, str]:
     """
     Resolve a plain '@Display Name' to (user_id, display_name) using guild members.
@@ -231,10 +274,8 @@ def resolve_name_to_member(guild: discord.Guild | None, name: str) -> tuple[int,
     for m in guild.members:
         if normalize_username(getattr(m, "global_name", "") or "") == target:
             return m.id, m.display_name
-    # Try alias table
     mapped = alias_lookup(name)
     if mapped:
-        # Find a current display name for the mention label if possible
         for m in guild.members:
             if m.id == mapped:
                 return m.id, m.display_name
@@ -474,24 +515,31 @@ async def alias_list_cmd(interaction: discord.Interaction):
             return
         lines = ["**Aliases:**"]
         for name_norm, uid in items:
-            lines.append(f"• `{name_norm}` → <@{uid}>")
+            # best-effort label
+            label = name_norm
+            if interaction.guild:
+                m = interaction.guild.get_member(uid)
+                if m:
+                    label = m.display_name
+            lines.append(f"• `{name_norm}` → {label} (<@{uid}>)")
         await interaction.followup.send("\n".join(lines), ephemeral=True)
     except Exception as e:
         traceback.print_exc()
         await interaction.followup.send(f"Alias list error: {e!r}", ephemeral=True)
 
-# ---- Leaderboard
-@tree.command(description="Show leaderboard over recent days (default 30).")
-@app_commands.describe(days="How many recent days to include (default 30).")
-async def leaderboard(interaction: discord.Interaction, days: Optional[int] = 30):
+# ---- Leaderboard (defaults to entire history)
+@tree.command(description="Show leaderboard for the entire history (or last N days).")
+@app_commands.describe(days="Optional: limit to last N days. Omit for entire history.")
+async def leaderboard(interaction: discord.Interaction, days: Optional[int] = None):
     if not await safe_defer(interaction):
         return
     try:
-        rows = fetch_leaderboard(days_back=days or 30)
+        rows = fetch_leaderboard(days_back=days)
         if not rows:
-            await interaction.followup.send(f"No data yet for {days} day(s).", ephemeral=True)
+            await interaction.followup.send("No data yet.", ephemeral=True)
             return
-        lines = [f"**Leaderboard (last {days} days)**\n_Min 5 games to rank_"]
+        title = "entire history" if days is None else f"last {days} days"
+        lines = [f"**Leaderboard ({title})**\n_Min 5 games to rank_"]
         for rank, (_key, label, avg, solves, misses, games) in enumerate(rows, 1):
             lines.append(f"#{rank} {label}: avg {avg:.2f} (solves {solves}, X {misses}, games {games})")
         await interaction.followup.send("\n".join(lines), ephemeral=True)
@@ -499,138 +547,47 @@ async def leaderboard(interaction: discord.Interaction, days: Optional[int] = 30
         traceback.print_exc()
         await interaction.followup.send("Error generating leaderboard.", ephemeral=True)
 
-# ---- Plot (ranked legend)
-@tree.command(description="Plot scores over time for a user or everyone.")
-@app_commands.describe(user="Which user to plot", days="How many days (default 30)")
-async def plot(interaction: discord.Interaction, user: Optional[discord.Member] = None, days: Optional[int] = 30):
-    if not await safe_defer(interaction):
-        return
-    try:
-        rows = fetch_scores(days_back=days or 30, user_id=user.id if user else None)
-        if not rows:
-            await interaction.followup.send("No scores found.", ephemeral=True)
-            return
-
-        series: Dict[tuple, Dict] = {}  # key -> {'label': str, 'points': list[(x, y)]}
-        for uid, uname, day, score, solved, ts in rows:
-            key = identity_key(uid or 0, uname or "")
-            label = identity_label(uid or 0, uname or "Unknown")
-            y = 7 if solved == 0 else score
-            series.setdefault(key, {"label": label, "points": []})["points"].append((day, y))
-
-        # Rank legend by average (best first)
-        ranked_series = []
-        for key, d in series.items():
-            ys = [p[1] for p in d["points"]]
-            if not ys: 
-                continue
-            avg = sum(ys)/len(ys)
-            ranked_series.append((avg, d))
-        ranked_series.sort(key=lambda t: t[0])
-
-        plt.figure()
-        for avg, d in ranked_series:
-            pts = sorted(d["points"], key=lambda t: t[0])
-            xs = [dd for dd,_ in pts]
-            ys = [yy for _,yy in pts]
-            plt.plot(xs, ys, marker="o", label=f"{d['label']} (avg {avg:.2f})")
-
-        plt.gca().invert_yaxis()
-        plt.xlabel("Wordle Day # (or YYYYMMDD)")
-        plt.ylabel("Guesses (X=7)")
-        plt.title(f"Scores — {days} days" + (f" — {user.display_name}" if user else ""))
-        plt.legend(bbox_to_anchor=(1.02, 1), loc="upper left")
-        plt.tight_layout()
-
-        buf = io.BytesIO()
-        plt.savefig(buf, format="png", dpi=180)
-        buf.seek(0)
-        await interaction.followup.send(file=discord.File(buf, "scores.png"), ephemeral=True)
-        plt.close()
-    except Exception:
-        traceback.print_exc()
-        await interaction.followup.send("Error generating plot.", ephemeral=True)
-
-# ---- Stats (ranked by average)
-@tree.command(description="Summary stats for a user or everyone.")
-@app_commands.describe(user="User to summarize", days="How many days (default 30)")
-async def stats(interaction: discord.Interaction, user: Optional[discord.Member] = None, days: Optional[int] = 30):
-    if not await safe_defer(interaction):
-        return
-    try:
-        rows = fetch_scores(days_back=days or 30, user_id=user.id if user else None)
-        if not rows:
-            await interaction.followup.send("No scores found.", ephemeral=True)
-            return
-
-        from statistics import mean, median
-        grouped: Dict[tuple, Dict] = {}  # key -> {'label': str, 'scores': list[Optional[int]]}
-
-        for uid, uname, _day, score, solved, _ts in rows:
-            key = identity_key(uid or 0, uname or "")
-            label = identity_label(uid or 0, uname or "Unknown")
-            g = grouped.setdefault(key, {"label": label, "scores": []})
-            g["scores"].append(score if solved == 1 else None)
-
-        rows_out = []
-        for g in grouped.values():
-            scores = g["scores"]
-            solved_scores = [s for s in scores if s is not None]
-            misses = sum(1 for s in scores if s is None)
-            games = len(scores)
-            avg = (sum(solved_scores)/len(solved_scores)) if solved_scores else 7.0
-            med = median(solved_scores) if solved_scores else 7.0
-            rows_out.append((avg, g["label"], games, med, misses, len(solved_scores)))
-
-        rows_out.sort(key=lambda t: t[0])  # best first
-        lines = [f"**Stats last {days} days:**"]
-        for avg, label, games, med, misses, solves in rows_out:
-            if solves:
-                lines.append(f"{label}: {games} games • avg {avg:.2f} • median {med:.2f} • X {misses}")
-            else:
-                lines.append(f"{label}: {games} games • all X")
-        await interaction.followup.send("\n".join(lines), ephemeral=True)
-    except Exception:
-        traceback.print_exc()
-        await interaction.followup.send("Error computing stats.", ephemeral=True)
-
-# ---- Histogram (ranked top N by average)
-@tree.command(description="Histogram of guess counts per user (ranked by avg).")
-@app_commands.describe(days="How many days to include (default 30)", top_n="Show top N users by average (default 6)")
-async def hist(interaction: discord.Interaction, days: Optional[int] = 30, top_n: Optional[int] = 6):
+# ---- Plot (histogram) — defaults to entire history
+@tree.command(name="plot", description="Histogram of guess counts per user (ranked by avg).")
+@app_commands.describe(days="Optional: limit to last N days (omit for entire history).",
+                       top_n="Show top N users by average (default 6)")
+async def plot_histogram(interaction: discord.Interaction, days: Optional[int] = None, top_n: Optional[int] = 6):
     if not await safe_defer(interaction): return
     try:
-        rows = fetch_scores(days_back=days or 30)
+        rows = fetch_scores(days_back=days)
         if not rows:
             await interaction.followup.send("No scores found.", ephemeral=True)
             return
 
+        # Aggregate per identity
         per_user: Dict[tuple, Dict] = {}
         for uid, uname, _day, score, solved, _ts in rows:
             key = identity_key(uid or 0, uname or "")
-            label = identity_label(uid or 0, uname or "Unknown")
+            # label for legend should be a human name, not <@id>
+            label = label_plain_for_hist(interaction.guild, uid or 0, uname or "Unknown")
             entry = per_user.setdefault(key, {"label": label, "counts": {i:0 for i in range(1,8)}})
             s = (score if solved == 1 else 7)
             entry["counts"][s] += 1
 
+        # Rank by average with X=7
         ranked = []
         for key, d in per_user.items():
-            # avg with X=7
             flat = []
             for g, c in d["counts"].items():
                 flat.extend([g]*c)
-            if not flat:
+            if not flat: 
                 continue
             avg = sum(flat)/len(flat)
             ranked.append((avg, key, d))
         ranked.sort(key=lambda t: t[0])
         ranked = ranked[: (top_n or 6)]
 
+        # Build grouped bar chart
         guesses = list(range(1, 8))  # 1..6 + 7=X
         width = 0.8 / max(1, len(ranked))
         centers = list(range(len(guesses)))
 
-        plt.figure()
+        plt.figure(figsize=(9.5, 6))  # wider canvas
         for i, (avg, key, d) in enumerate(ranked):
             counts = [d["counts"].get(g, 0) for g in guesses]
             xs = [c + (i - (len(ranked)-1)/2)*width for c in centers]
@@ -639,12 +596,15 @@ async def hist(interaction: discord.Interaction, days: Optional[int] = 30, top_n
         plt.xticks(centers, [1,2,3,4,5,6,"X"])
         plt.xlabel("Guesses (X = fail)")
         plt.ylabel("Count")
-        plt.title(f"Guess histogram — {days} days (top {len(ranked)} by avg)")
-        plt.legend(bbox_to_anchor=(1.02, 1), loc="upper left")
+        title_scope = "entire history" if days is None else f"last {days} days"
+        plt.title(f"Guess histogram — {title_scope} (top {len(ranked)} by avg)")
+        # Put legend below the plot, allow it to span multiple columns
+        ncols = max(2, min(len(ranked), 4))
+        plt.legend(loc="upper center", bbox_to_anchor=(0.5, -0.15), ncol=ncols)
         plt.tight_layout()
 
         buf = io.BytesIO()
-        plt.savefig(buf, format="png", dpi=180)
+        plt.savefig(buf, format="png", dpi=180, bbox_inches="tight")
         buf.seek(0)
         await interaction.followup.send(file=discord.File(buf, "hist.png"), ephemeral=True)
         plt.close()
