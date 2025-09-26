@@ -1,6 +1,6 @@
 from __future__ import annotations
-import unicodedata
-import os, io, re, sys, sqlite3, datetime as dt, traceback
+
+import os, io, re, sqlite3, datetime as dt, traceback, unicodedata
 from dataclasses import dataclass
 from typing import Optional, List, Tuple, Dict
 
@@ -29,6 +29,7 @@ OWNER_ID = int(os.getenv("OWNER_ID") or "0")
 WORDLE_CHANNEL_ID = int(os.getenv("WORDLE_CHANNEL_ID") or "0")   # optional scope
 WORDLE_BOT_ID = int(os.getenv("WORDLE_BOT_ID") or "0")           # recommended
 DB_PATH = os.getenv("DB_PATH") or "wordle_scores.db"
+MAX_BACKFILL = int(os.getenv("MAX_BACKFILL") or "5000")
 
 INTENTS = discord.Intents.default()
 INTENTS.message_content = True
@@ -51,6 +52,14 @@ def init_db():
             );
             """
         )
+        con.execute(
+            """
+            CREATE TABLE IF NOT EXISTS kv (
+                k TEXT PRIMARY KEY,
+                v TEXT NOT NULL
+            );
+            """
+        )
 
 def init_aliases_db():
     with sqlite3.connect(DB_PATH) as con:
@@ -60,6 +69,15 @@ def init_aliases_db():
             user_id    INTEGER NOT NULL
         );
         """)
+
+def kv_get(key: str) -> Optional[str]:
+    with sqlite3.connect(DB_PATH) as con:
+        row = con.execute("SELECT v FROM kv WHERE k=?;", (key,)).fetchone()
+        return row[0] if row else None
+
+def kv_set(key: str, value: str):
+    with sqlite3.connect(DB_PATH) as con:
+        con.execute("INSERT INTO kv (k, v) VALUES (?, ?) ON CONFLICT(k) DO UPDATE SET v=excluded.v;", (key, value))
 
 def upsert_score(user_id: int, username: str, day: int, score: Optional[int], solved: bool):
     with sqlite3.connect(DB_PATH) as con:
@@ -85,7 +103,7 @@ def upsert_score(user_id: int, username: str, day: int, score: Optional[int], so
 
 def fetch_scores(days_back: Optional[int] = None, user_id: Optional[int] = None) -> List[Tuple]:
     """
-    Return rows in the last `days_back` days using ts (ISO); if days_back is None,
+    Return rows in the last `days_back` days using ts; if days_back is None,
     return the entire history.
     """
     with sqlite3.connect(DB_PATH) as con:
@@ -104,7 +122,7 @@ def fetch_scores(days_back: Optional[int] = None, user_id: Optional[int] = None)
                      ORDER BY user_id, ts ASC;
                 """)
         else:
-            cutoff = (dt.datetime.utcnow() - dt.timedelta(days=(days_back or 1) - 1)).isoformat()
+            cutoff = (dt.datetime.utcnow() - dt.timedelta(days=max(1, days_back) - 1)).isoformat()
             if user_id:
                 cur = con.execute("""
                     SELECT user_id, username, day, score, solved, ts
@@ -134,7 +152,7 @@ def fetch_leaderboard(days_back: Optional[int] = None, min_games: int = 5) -> Li
                  ORDER BY ts ASC;
             """))
         else:
-            cutoff = (dt.datetime.utcnow() - dt.timedelta(days=(days_back or 1) - 1)).isoformat()
+            cutoff = (dt.datetime.utcnow() - dt.timedelta(days=max(1, days_back) - 1)).isoformat()
             rows = list(con.execute("""
                 SELECT user_id, username, score, solved, ts
                   FROM scores
@@ -168,8 +186,8 @@ def fetch_leaderboard(days_back: Optional[int] = None, min_games: int = 5) -> Li
 # ========= Identity & alias helpers =========
 def normalize_username(s: str) -> str:
     """
-    Normalize a display name for matching/aliasing:
-    - NFKC normalize (unicode)
+    Strong normalization for aliasing:
+    - NFKC unicode normalize
     - strip leading '@', trim
     - lowercase
     - remove all non-alphanumeric chars (spaces, punctuation, emoji)
@@ -179,13 +197,10 @@ def normalize_username(s: str) -> str:
     if s.startswith("@"):
         s = s[1:]
     s = s.lower()
-    # keep only a-z and 0-9
     s = "".join(ch for ch in s if ch.isalnum())
     return s
 
-
 def alias_lookup(name: str) -> int:
-    """Return mapped user_id for a normalized display name if one exists; else 0."""
     n = normalize_username(name)
     with sqlite3.connect(DB_PATH) as con:
         row = con.execute("SELECT user_id FROM aliases WHERE name_norm = ?;", (n,)).fetchone()
@@ -210,10 +225,7 @@ def alias_list() -> list[tuple[str,int]]:
         return list(con.execute("SELECT name_norm, user_id FROM aliases ORDER BY name_norm;"))
 
 def apply_alias_to_history(name: str, user_id: int, display_name: str):
-    """
-    Retroactively migrate rows where user_id==0 and normalized username matches 'name'
-    to the provided user_id/display_name.
-    """
+    """Retro-migrate user_id==0 rows whose normalized username matches."""
     n = normalize_username(name)
     with sqlite3.connect(DB_PATH) as con:
         rows = list(con.execute("SELECT rowid, user_id, username, day, score, solved, ts FROM scores WHERE user_id = 0;"))
@@ -241,7 +253,7 @@ def identity_key(user_id: int, username: str) -> tuple:
     return (0, normalize_username(username))
 
 def identity_label(user_id: int, username: str) -> str:
-    """Label prefers real user mention; else alias mention; else raw name."""
+    """Label used in text (mentions are fine there)."""
     if user_id:
         return f"<@{user_id}>"
     mapped = alias_lookup(username)
@@ -250,17 +262,13 @@ def identity_label(user_id: int, username: str) -> str:
     return username or "Unknown"
 
 def label_plain_for_hist(guild: discord.Guild | None, user_id: int, username: str) -> str:
-    """
-    A human-friendly label for plots: prefer a display name string (not a mention).
-    """
+    """Legend label: prefer readable display names (no <@id>)."""
     if user_id:
-        # Best effort: current display name if we can see the member
         if guild:
             m = guild.get_member(user_id)
             if m and m.display_name:
                 return m.display_name
         return username or f"user:{user_id}"
-    # If alias maps to an ID, try to resolve to a name
     mapped = alias_lookup(username)
     if mapped:
         if guild:
@@ -269,29 +277,6 @@ def label_plain_for_hist(guild: discord.Guild | None, user_id: int, username: st
                 return m.display_name
         return username or f"user:{mapped}"
     return username or "Unknown"
-
-def resolve_name_to_member(guild: discord.Guild | None, name: str) -> tuple[int, str]:
-    """
-    Resolve a plain '@Display Name' to (user_id, display_name) using guild members.
-    If not found, return (0, original_name). Alias mapping will also catch it later.
-    """
-    if not guild:
-        return 0, name
-    target = normalize_username(name)
-    for m in guild.members:
-        if normalize_username(m.display_name) == target:
-            return m.id, m.display_name
-    # Try global name fallback
-    for m in guild.members:
-        if normalize_username(getattr(m, "global_name", "") or "") == target:
-            return m.id, m.display_name
-    mapped = alias_lookup(name)
-    if mapped:
-        for m in guild.members:
-            if m.id == mapped:
-                return m.id, m.display_name
-        return mapped, name
-    return 0, name
 
 
 # ========= Data model & parsing =========
@@ -307,11 +292,9 @@ DAY_RE_TEXT = re.compile(r"\bWordle\s+(?:No\.?\s*)?(?P<day>\d+)\b", re.IGNORECAS
 SCORE_LINE_RE = re.compile(r"^(?:\*\*)?(?:👑\s*)?(?P<score>[Xx]|\d)\/6:\s*(?P<rest>.+)$")
 
 def _extract_day_from_message(msg: discord.Message) -> Optional[int]:
-    # Try text
     m = DAY_RE_TEXT.search(msg.content or "")
     if m:
         return int(m.group("day"))
-    # Try embeds (title/description)
     for emb in msg.embeds:
         if emb.title:
             m = DAY_RE_TEXT.search(emb.title)
@@ -323,20 +306,18 @@ def _extract_day_from_message(msg: discord.Message) -> Optional[int]:
 
 def parse_group_summary_style(msg: discord.Message) -> List[ParsedScore]:
     """
-    Handles lines like:
-      '👑 2/6: @Where Jon Al Gaib'
-      '3/6: <@2866> <@1296> <@2680> <@3827>'
-      '4/6: @Name One @Name Two'   (no real mentions)
-    If Wordle number is missing, infer "yesterday UTC" as YYYYMMDD.
+    Supports lines like:
+      '👑 2/6: @Name'
+      '3/6: <@123> <@456> ...'
+      '4/6: @Name One @Name Two'  (no real mentions)
+    If Wordle number missing, infer "yesterday UTC" as YYYYMMDD.
     """
     day = _extract_day_from_message(msg)
     if day is None:
-        utc_dt = msg.created_at
-        d = (utc_dt - dt.timedelta(days=1)).date()
+        d = (msg.created_at - dt.timedelta(days=1)).date()
         day = d.year * 10000 + d.month * 100 + d.day
 
-    results: List[ParsedScore] = []
-
+    out: List[ParsedScore] = []
     for raw in (msg.content or "").splitlines():
         line = raw.strip()
         m = SCORE_LINE_RE.match(line)
@@ -348,29 +329,22 @@ def parse_group_summary_style(msg: discord.Message) -> List[ParsedScore]:
         score_val = None if raw_score.lower() == "x" else int(raw_score)
         solved = score_val is not None
 
-        # 1) Real mentions first
+        # Real mentions first
         mention_ids = [int(mm.group("id")) for mm in re.finditer(r"<@!?(?P<id>\d+)>", rest)]
         if mention_ids:
             id_to_member = {mem.id: mem for mem in msg.mentions}
             for uid in mention_ids:
                 member = id_to_member.get(uid)
                 username = member.display_name if member else f"user:{uid}"
-                results.append(ParsedScore(user_id=uid, username=username, day=day,
-                                           score=score_val, solved=solved))
+                out.append(ParsedScore(user_id=uid, username=username, day=day, score=score_val, solved=solved))
             continue
 
-        # 2) Multiple plain @Display Name chunks
-        if "@" in rest:
-            names = [t.strip() for t in rest.split("@") if t.strip()]
-        else:
-            names = [rest]  # rare fallback
-
+        # Multiple plain @Display Name tokens
+        names = [t.strip() for t in rest.split("@") if t.strip()] if "@" in rest else [rest]
         for name in names:
             uid, display = resolve_name_to_member(msg.guild, name)
-            results.append(ParsedScore(user_id=uid, username=display, day=day,
-                                       score=score_val, solved=solved))
-
-    return results
+            out.append(ParsedScore(user_id=uid, username=display, day=day, score=score_val, solved=solved))
+    return out
 
 def message_in_scope(msg: discord.Message) -> bool:
     return (not WORDLE_CHANNEL_ID) or (msg.channel.id == WORDLE_CHANNEL_ID)
@@ -381,7 +355,9 @@ bot = commands.Bot(command_prefix="!", intents=INTENTS)
 tree = bot.tree
 
 async def safe_defer(interaction: discord.Interaction, *, ephemeral: bool = True, thinking: bool = True) -> bool:
-    """Acknowledge the interaction; return False if it's already expired (cold start)."""
+    """
+    Default is EPHEMERAL (private). Public commands pass ephemeral=False.
+    """
     if interaction.response.is_done():
         return True
     try:
@@ -393,6 +369,58 @@ async def safe_defer(interaction: discord.Interaction, *, ephemeral: bool = True
     except Exception as e:
         print("safe_defer: unexpected error:", repr(e))
         return False
+
+
+async def do_rescan_channel(channel: discord.abc.Messageable, limit: int) -> int:
+    """Scan channel history and ingest messages."""
+    parsed = 0
+    if not isinstance(channel, (discord.TextChannel, discord.Thread)):
+        return parsed
+    async for msg in channel.history(limit=limit, oldest_first=True):
+        if bot.user and msg.author.id == bot.user.id:
+            continue
+        if not message_in_scope(msg):
+            continue
+        if (WORDLE_BOT_ID and msg.author.id == WORDLE_BOT_ID) or (not WORDLE_BOT_ID and msg.author.bot):
+            for p in parse_group_summary_style(msg):
+                upsert_score(p.user_id or 0, p.username, p.day, p.score, p.solved)
+                parsed += 1
+            continue
+        m = re.search(r"\bWordle\s+(?P<day>\d+)\s+(?P<score>[Xx]|\d)\/6\b",
+                      msg.content or "", re.IGNORECASE)
+        if m:
+            day = int(m.group("day"))
+            s = m.group("score")
+            score_val = None if s.lower() == "x" else int(s)
+            upsert_score(msg.author.id, msg.author.display_name, day,
+                         score_val, score_val is not None)
+            parsed += 1
+    return parsed
+
+async def ensure_daily_backfill(interaction: discord.Interaction) -> None:
+    """
+    If we haven't backfilled yet today (UTC), run a rescan BEFORE producing
+    public outputs so data is up-to-date.
+    """
+    today_ymd = dt.datetime.utcnow().date().isoformat()  # 'YYYY-MM-DD'
+    last = kv_get("last_backfill_ymd")
+    if last == today_ymd:
+        return
+
+    # Choose channel: WORDLE_CHANNEL_ID preferred; else current channel
+    channel: discord.abc.Messageable
+    if WORDLE_CHANNEL_ID and interaction.guild:
+        ch = interaction.guild.get_channel(WORDLE_CHANNEL_ID)
+        channel = ch or interaction.channel
+    else:
+        channel = interaction.channel
+
+    try:
+        count = await do_rescan_channel(channel, MAX_BACKFILL)
+        kv_set("last_backfill_ymd", today_ymd)
+        print(f"Auto-backfill ran: parsed {count} message items; set day={today_ymd}")
+    except Exception:
+        traceback.print_exc()
 
 
 @bot.event
@@ -462,6 +490,7 @@ async def on_app_command_error(interaction: discord.Interaction, error: Exceptio
 # ========= Slash commands =========
 @tree.command(description="Ping (quick test)")
 async def ping(interaction: discord.Interaction):
+    # Private (ephemeral) ping
     if not interaction.response.is_done():
         await interaction.response.send_message("Pong!", ephemeral=True)
 
@@ -471,7 +500,7 @@ async def sync(interaction: discord.Interaction, scope: str | None = "guild"):
     if OWNER_ID and interaction.user.id != OWNER_ID:
         await interaction.response.send_message("Not authorized.", ephemeral=True)
         return
-    if not await safe_defer(interaction):
+    if not await safe_defer(interaction, ephemeral=True):
         return
     try:
         if (scope or "guild").lower() == "global":
@@ -484,14 +513,14 @@ async def sync(interaction: discord.Interaction, scope: str | None = "guild"):
     except Exception as e:
         await interaction.followup.send(f"Sync error: {e!r}", ephemeral=True)
 
-# ---- Alias management
+# ---- Alias management (ephemeral)
 @tree.command(description="Admin: add an alias mapping (old nickname -> @user)")
 @app_commands.describe(name="The old display name as it appears in summaries", user="The real user to map to")
 async def alias_add(interaction: discord.Interaction, name: str, user: discord.Member):
     if OWNER_ID and interaction.user.id != OWNER_ID:
         await interaction.response.send_message("Not authorized.", ephemeral=True)
         return
-    if not await safe_defer(interaction): return
+    if not await safe_defer(interaction, ephemeral=True): return
     try:
         alias_set(name, user.id)
         apply_alias_to_history(name, user.id, user.display_name)
@@ -505,7 +534,7 @@ async def alias_remove(interaction: discord.Interaction, name: str):
     if OWNER_ID and interaction.user.id != OWNER_ID:
         await interaction.response.send_message("Not authorized.", ephemeral=True)
         return
-    if not await safe_defer(interaction): return
+    if not await safe_defer(interaction, ephemeral=True): return
     try:
         alias_delete(name)
         await interaction.followup.send(f"Alias removed: “{name}”.", ephemeral=True)
@@ -518,7 +547,7 @@ async def alias_list_cmd(interaction: discord.Interaction):
     if OWNER_ID and interaction.user.id != OWNER_ID:
         await interaction.response.send_message("Not authorized.", ephemeral=True)
         return
-    if not await safe_defer(interaction): return
+    if not await safe_defer(interaction, ephemeral=True): return
     try:
         items = alias_list()
         if not items:
@@ -526,7 +555,6 @@ async def alias_list_cmd(interaction: discord.Interaction):
             return
         lines = ["**Aliases:**"]
         for name_norm, uid in items:
-            # best-effort label
             label = name_norm
             if interaction.guild:
                 m = interaction.guild.get_member(uid)
@@ -538,68 +566,72 @@ async def alias_list_cmd(interaction: discord.Interaction):
         traceback.print_exc()
         await interaction.followup.send(f"Alias list error: {e!r}", ephemeral=True)
 
-# ---- Leaderboard (defaults to entire history)
+# ---- Leaderboard (PUBLIC; entire history default) + auto daily backfill
 @tree.command(description="Show leaderboard for the entire history (or last N days).")
 @app_commands.describe(days="Optional: limit to last N days. Omit for entire history.")
 async def leaderboard(interaction: discord.Interaction, days: Optional[int] = None):
-    if not await safe_defer(interaction):
+    # Ensure up-to-date before public post
+    await ensure_daily_backfill(interaction)
+    if not await safe_defer(interaction, ephemeral=False):
         return
     try:
         rows = fetch_leaderboard(days_back=days)
         if not rows:
-            await interaction.followup.send("No data yet.", ephemeral=True)
+            await interaction.followup.send("No data yet.")
             return
         title = "entire history" if days is None else f"last {days} days"
         lines = [f"**Leaderboard ({title})**\n_Min 5 games to rank_"]
         for rank, (_key, label, avg, solves, misses, games) in enumerate(rows, 1):
             lines.append(f"#{rank} {label}: avg {avg:.2f} (solves {solves}, X {misses}, games {games})")
-        await interaction.followup.send("\n".join(lines), ephemeral=True)
+        await interaction.followup.send("\n".join(lines))  # public
     except Exception:
         traceback.print_exc()
-        await interaction.followup.send("Error generating leaderboard.", ephemeral=True)
+        await interaction.followup.send("Error generating leaderboard.")
 
-# ---- Plot (histogram) — defaults to entire history
+# ---- Plot (PUBLIC histogram; entire history default) + auto daily backfill
 @tree.command(name="plot", description="Histogram of guess counts per user (ranked by avg).")
 @app_commands.describe(days="Optional: limit to last N days (omit for entire history).",
-                       top_n="Show top N users by average (default 6)")
-async def plot_histogram(interaction: discord.Interaction, days: Optional[int] = None, top_n: Optional[int] = 6):
-    if not await safe_defer(interaction): return
+                       top_n="Optional: show only top N users by average")
+async def plot_histogram(interaction: discord.Interaction, days: Optional[int] = None, top_n: Optional[int] = None):
+    # Ensure up-to-date before public post
+    await ensure_daily_backfill(interaction)
+    if not await safe_defer(interaction, ephemeral=False): 
+        return
     try:
         rows = fetch_scores(days_back=days)
         if not rows:
-            await interaction.followup.send("No scores found.", ephemeral=True)
+            await interaction.followup.send("No scores found.")
             return
 
         # Aggregate per identity
         per_user: Dict[tuple, Dict] = {}
         for uid, uname, _day, score, solved, _ts in rows:
             key = identity_key(uid or 0, uname or "")
-            # label for legend should be a human name, not <@id>
             label = label_plain_for_hist(interaction.guild, uid or 0, uname or "Unknown")
             entry = per_user.setdefault(key, {"label": label, "counts": {i:0 for i in range(1,8)}})
             s = (score if solved == 1 else 7)
             entry["counts"][s] += 1
 
-        # Rank by average with X=7
+        # Rank by average (X=7)
         ranked = []
         for key, d in per_user.items():
             flat = []
             for g, c in d["counts"].items():
                 flat.extend([g]*c)
-            if not flat: 
+            if not flat:
                 continue
             avg = sum(flat)/len(flat)
             ranked.append((avg, key, d))
         ranked.sort(key=lambda t: t[0])
-        ranked = ranked[: (top_n or 6)]
+        if top_n:
+            ranked = ranked[: top_n]
 
-        # Build grouped bar chart
         guesses = list(range(1, 8))  # 1..6 + 7=X
         width = 0.8 / max(1, len(ranked))
         centers = list(range(len(guesses)))
 
-        plt.figure(figsize=(9.5, 6))  # wider canvas
-        for i, (avg, key, d) in enumerate(ranked):
+        plt.figure(figsize=(12, 7))
+        for i, (avg, _key, d) in enumerate(ranked):
             counts = [d["counts"].get(g, 0) for g in guesses]
             xs = [c + (i - (len(ranked)-1)/2)*width for c in centers]
             plt.bar(xs, counts, width=width, label=f"{d['label']} (avg {avg:.2f})")
@@ -608,26 +640,26 @@ async def plot_histogram(interaction: discord.Interaction, days: Optional[int] =
         plt.xlabel("Guesses (X = fail)")
         plt.ylabel("Count")
         title_scope = "entire history" if days is None else f"last {days} days"
-        plt.title(f"Guess histogram — {title_scope} (top {len(ranked)} by avg)")
-        # Put legend below the plot, allow it to span multiple columns
-        ncols = max(2, min(len(ranked), 4))
+        audience = f"(top {len(ranked)} by avg)" if top_n else f"({len(ranked)} users)"
+        plt.title(f"Guess histogram — {title_scope} {audience}")
+        ncols = max(2, min(len(ranked), 6))
         plt.legend(loc="upper center", bbox_to_anchor=(0.5, -0.15), ncol=ncols)
         plt.tight_layout()
 
         buf = io.BytesIO()
         plt.savefig(buf, format="png", dpi=180, bbox_inches="tight")
         buf.seek(0)
-        await interaction.followup.send(file=discord.File(buf, "hist.png"), ephemeral=True)
+        await interaction.followup.send(file=discord.File(buf, "hist.png"))  # public
         plt.close()
     except Exception:
         traceback.print_exc()
-        await interaction.followup.send("Error generating histogram.", ephemeral=True)
+        await interaction.followup.send("Error generating histogram.")
 
-# ---- Rescan/backfill
+# ---- Rescan/backfill (manual; ephemeral)
 @tree.command(description="Re-parse last N messages.")
 @app_commands.describe(limit="How many messages (default 500)")
 async def rescan(interaction: discord.Interaction, limit: Optional[int] = 500):
-    if not await safe_defer(interaction):
+    if not await safe_defer(interaction, ephemeral=True):
         return
     try:
         channel = interaction.channel
@@ -635,31 +667,10 @@ async def rescan(interaction: discord.Interaction, limit: Optional[int] = 500):
             await interaction.followup.send("Run in a text channel.", ephemeral=True)
             return
 
-        parsed = 0
-        async for msg in channel.history(limit=limit or 500, oldest_first=True):
-            if bot.user and msg.author.id == bot.user.id:
-                continue
-            if not message_in_scope(msg):
-                continue
-
-            if (WORDLE_BOT_ID and msg.author.id == WORDLE_BOT_ID) or \
-               (not WORDLE_BOT_ID and message.author.bot):
-                for p in parse_group_summary_style(msg):
-                    upsert_score(p.user_id or 0, p.username, p.day, p.score, p.solved)
-                    parsed += 1
-                continue
-
-            m = re.search(r"\bWordle\s+(?P<day>\d+)\s+(?P<score>[Xx]|\d)\/6\b",
-                          msg.content or "", re.IGNORECASE)
-            if m:
-                day = int(m.group("day"))
-                s = m.group("score")
-                score_val = None if s.lower() == "x" else int(s)
-                upsert_score(msg.author.id, msg.author.display_name, day,
-                             score_val, score_val is not None)
-                parsed += 1
-
+        parsed = await do_rescan_channel(channel, (limit or 500))
         await interaction.followup.send(f"Rescan complete. Parsed {parsed}.", ephemeral=True)
+        # Mark today's backfill done so /plot & /leaderboard won't re-run immediately
+        kv_set("last_backfill_ymd", dt.datetime.utcnow().date().isoformat())
     except Exception:
         traceback.print_exc()
         await interaction.followup.send("Error during rescan.", ephemeral=True)
