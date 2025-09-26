@@ -468,20 +468,36 @@ def parse_group_summary_style(msg: discord.Message) -> List[ParsedScore]:
         mention_ids = [int(mm.group("id")) for mm in re.finditer(r"<@!?(?P<id>\d+)>", rest)]
         if mention_ids:
             id_to_member = {mem.id: mem for mem in msg.mentions}
+            # record all real mentions
             for uid in mention_ids:
                 member = id_to_member.get(uid)
                 username = member.display_name if member else f"user:{uid}"
                 out.append(ParsedScore(user_id=uid, username=username, day=day, score=score_val, solved=solved))
+
+            # NEW: remove the real-mention tokens and keep parsing what's left
+            rest_wo_mentions = re.sub(r"<@!?\d+>", " ", rest).strip()
+            rest_wo_mentions = re.sub(r"\s+", " ", rest_wo_mentions)
+
+            if rest_wo_mentions:
+                if "@" in rest_wo_mentions:
+                    # Plain-text '@' segments
+                    segs = [s.strip() for s in rest_wo_mentions.split("@") if s.strip()]
+                    for seg in segs:
+                        uid, label = best_match_member_or_alias(msg.guild, seg)
+                        out.append(ParsedScore(user_id=uid, username=label, day=day, score=score_val, solved=solved))
+                else:
+                    # Free-text fallback (names without '@')
+                    detected = detect_names_in_free_text(msg.guild, rest_wo_mentions)
+                    if detected:
+                        for uid, display in detected:
+                            out.append(ParsedScore(user_id=uid, username=display, day=day, score=score_val, solved=solved))
+                    else:
+                        uid, display = resolve_name_to_member(msg.guild, rest_wo_mentions)
+                        out.append(ParsedScore(user_id=uid, username=display, day=day, score=score_val, solved=solved))
+
+            # IMPORTANT: don't `continue` — we've already handled both mentions and the leftovers
             continue
 
-        # 2) Plain-text '@' segments (NEW robust path)
-        if "@" in rest:
-            # Split on '@' and ignore empties; each piece is a candidate name up to the next '@'
-            segs = [s.strip() for s in rest.split("@") if s.strip()]
-            for seg in segs:
-                uid, label = best_match_member_or_alias(msg.guild, seg)
-                out.append(ParsedScore(user_id=uid, username=label, day=day, score=score_val, solved=solved))
-            continue
 
         # 3) No '@' at all — scan free text (fallback)
         detected = detect_names_in_free_text(msg.guild, rest)
