@@ -168,7 +168,9 @@ def fetch_leaderboard(days_back: Optional[int] = None, min_games: int = 25) -> L
         games = len(g["scores"]) + g["misses"]
         if games < min_games:
             continue
-        avg = (sum(g["scores"]) / len(g["scores"])) if g["scores"] else 7.0
+        # FIX: include misses as 7's in the average
+        total_points = sum(g["scores"]) + 7 * g["misses"]
+        avg = total_points / games if games > 0 else 7.0
         out.append((key, g["label"], avg, g["solves"], g["misses"], games))
 
     out.sort(key=lambda t: (t[2], -t[3]))  # avg asc, solves desc
@@ -277,12 +279,10 @@ MEMBER_INDEX: Dict[int, Dict[str, Tuple[int, str]]] = {}
 
 async def build_member_index(guild: discord.Guild):
     """Fetch and index all members so fuzzy-matching has complete data."""
-    # Ensure we have the full list (requires Server Members Intent enabled in the bot portal)
     try:
         async for _ in guild.fetch_members(limit=None):
             pass
     except Exception:
-        # If fetch fails, we’ll still index whatever is cached
         traceback.print_exc()
 
     index: Dict[str, Tuple[int, str]] = {}
@@ -291,7 +291,6 @@ async def build_member_index(guild: discord.Guild):
         norm = normalize_username(label)
         if norm:
             index[norm] = (m.id, label)
-        # Also index global_name as an alternate key
         gn = getattr(m, "global_name", "") or ""
         if gn:
             norm_gn = normalize_username(gn)
@@ -316,7 +315,6 @@ def resolve_name_to_member(guild: discord.Guild | None, name: str) -> tuple[int,
     if hit:
         return hit
 
-    # Fallback: iterate members if index missing
     for m in guild.members:
         if normalize_username(m.display_name) == target:
             return m.id, m.display_name
@@ -366,35 +364,31 @@ def detect_names_in_free_text(guild: discord.Guild | None, text: str) -> list[tu
 def best_match_member_or_alias(
     guild: discord.Guild | None,
     raw_name: str,
-    ratio_threshold: float = 0.72  # a bit lower; handles long/complex names better
+    ratio_threshold: float = 0.72
 ) -> tuple[int, str]:
     """
     Given a raw name fragment (from an '@' segment), return (user_id, display_name)
     using normalized exact and fuzzy matching over the member index and alias table.
     """
     cleaned = raw_name.strip()
-    # Permit letters, digits, spaces, apostrophes (straight/curly), hyphens, underscores
     cleaned = re.sub(r"[^A-Za-z0-9'’ _-]+", " ", cleaned)
     cleaned = re.sub(r"\s+", " ", cleaned).strip()
     if not cleaned:
         return 0, raw_name
 
     target_norm = normalize_username(cleaned)
-    # Exact via index
     hit = member_index_lookup(guild, target_norm) if guild else None
     if hit:
         return hit
 
     best = (0.0, 0, cleaned)  # (score, user_id, label)
 
-    # Fuzzy vs member index
     if guild and guild.id in MEMBER_INDEX:
         for norm, (uid, label) in MEMBER_INDEX[guild.id].items():
             score = difflib.SequenceMatcher(None, norm, target_norm).ratio()
             if score > best[0]:
                 best = (score, uid, label)
 
-    # Exact/ fuzzy vs aliases
     try:
         with sqlite3.connect(DB_PATH) as con:
             for name_norm, uid in con.execute("SELECT name_norm, user_id FROM aliases;"):
@@ -482,7 +476,6 @@ def parse_group_summary_style(msg: discord.Message) -> List[ParsedScore]:
                 member = id_to_member.get(uid)
                 username = member.display_name if member else f"user:{uid}"
                 out.append(ParsedScore(user_id=uid, username=username, day=day, score=score_val, solved=solved))
-
             rest = re.sub(r"<@!?\d+>", " ", rest)
             rest = re.sub(r"\s+", " ", rest).strip()
 
@@ -610,7 +603,6 @@ async def on_guild_available(guild: discord.Guild):
 
 @bot.event
 async def on_member_update(before: discord.Member, after: discord.Member):
-    # Keep the index fresh if display names change
     await build_member_index(after.guild)
 
 @bot.event
@@ -826,7 +818,7 @@ async def plot_histogram(interaction: discord.Interaction, days: Optional[int] =
                 flat.extend([g]*c)
             if not flat:
                 continue
-            avg = sum(flat)/len(flat)
+            avg = sum(flat)/len(flat)  # X already counted as 7 in flat
             ranked.append((avg, key, d))
         ranked.sort(key=lambda t: t[0])
         if top_n:
