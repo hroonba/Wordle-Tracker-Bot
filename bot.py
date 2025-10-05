@@ -133,8 +133,11 @@ def apply_retcon(user_id: int, change: int) -> int:
         new_val = cur + change
         if new_val > 0:  # clamp at 0; never allow positive total delta
             new_val = 0
-        con.execute("INSERT INTO retcons(user_id, delta_x) VALUES(?, ?) ON CONFLICT(user_id) DO UPDATE SET delta_x=excluded.delta_x;",
-                    (user_id, new_val))
+        con.execute(
+            "INSERT INTO retcons(user_id, delta_x) VALUES(?, ?) "
+            "ON CONFLICT(user_id) DO UPDATE SET delta_x=excluded.delta_x;",
+            (user_id, new_val),
+        )
         return new_val
 
 def fetch_all_scores() -> List[Tuple]:
@@ -209,7 +212,10 @@ def load_aliases_file(guild: Optional[discord.Guild] = None) -> int:
         return 0
     try:
         with open(ALIASES_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
+            content = f.read().strip()
+            if not content:
+                return 0  # empty file; ignore
+            data = json.loads(content)
         items = data.get("aliases", [])
         count = 0
         for it in items:
@@ -228,6 +234,7 @@ def load_aliases_file(guild: Optional[discord.Guild] = None) -> int:
             count += 1
         return count
     except Exception:
+        # swallow JSON/IO errors so the bot still boots
         traceback.print_exc()
         return 0
 
@@ -545,26 +552,21 @@ _AVATAR_COLOR_CACHE: Dict[int, Tuple[float,float,float]] = {}
 def _dominant_color_from_bytes(b: bytes) -> Tuple[float,float,float]:
     img = Image.open(BytesIO(b)).convert("RGB")
     img = img.resize((32, 32))
-    # Simple average color
     pixels = list(img.getdata())
     r = sum(p[0] for p in pixels) / len(pixels)
     g = sum(p[1] for p in pixels) / len(pixels)
     b_ = sum(p[2] for p in pixels) / len(pixels)
-    # Return normalized matplotlib RGB [0,1]
     return (r/255.0, g/255.0, b_/255.0)
 
 def get_user_color(guild: Optional[discord.Guild], user_id: int) -> Tuple[float,float,float]:
     if user_id in _AVATAR_COLOR_CACHE:
         return _AVATAR_COLOR_CACHE[user_id]
-    # Fallback deterministic pastel if anything fails
     def fallback(uid: int) -> Tuple[float,float,float]:
         h = (uid % 360) / 360.0
-        # simple HSV->RGB-ish pastel
         r = 0.5 + 0.4*math.sin(2*math.pi*h)
         g = 0.5 + 0.4*math.sin(2*math.pi*(h+1/3))
         b = 0.5 + 0.4*math.sin(2*math.pi*(h+2/3))
         return (max(0,min(1,r)), max(0,min(1,g)), max(0,min(1,b)))
-
     try:
         if guild:
             m = guild.get_member(user_id)
@@ -812,7 +814,7 @@ async def leaderboard(interaction: discord.Interaction):
             avg = total_points / games if games > 0 else 7.0
             out.append((avg, g["label"], len(g["solved_scores"]), effective_misses, games))
 
-        out.sort(key=lambda t: (t[0], -t[2]))  # avg asc, solves desc
+        out.sort(key=lambda t: (t[2] == 0, t[0], -t[2]))  # prefer anyone with games, then avg asc, solves desc
         if not out:
             await interaction.followup.send("No one meets the minimum games (20)."); return
 
@@ -833,9 +835,6 @@ async def stats(interaction: discord.Interaction, user: Optional[str] = None):
     try:
         # Resolve user
         target_id = 0; target_label = ""
-        if interaction.guild and interaction.data and "resolved" in interaction.data:
-            pass  # standard resolution handled when using mention-type option (not used here)
-
         member_obj: Optional[discord.Member] = None
         if interaction.guild and user and user.startswith("<@") and user.endswith(">"):
             try:
@@ -853,9 +852,7 @@ async def stats(interaction: discord.Interaction, user: Optional[str] = None):
         if member_obj:
             target_id = member_obj.id
             target_label = member_obj.display_name or member_obj.name
-
         if not target_id:
-            # fallback to the invoker
             target_id = interaction.user.id
             target_label = interaction.user.display_name or interaction.user.name
 
@@ -868,17 +865,14 @@ async def stats(interaction: discord.Interaction, user: Optional[str] = None):
 
         # Tally
         counts = {i: 0 for i in range(1, 8)}  # 1..6 + 7 (X)
-        solved_scores = []
         for _uid, _uname, _day, score, solved, _ts in user_rows:
             if solved == 1:
-                solved_scores.append(score)
                 counts[score] += 1
             else:
                 counts[7] += 1
 
         delta = get_retcon_delta(target_id)
         if delta < 0:
-            # reduce X bin but never below 0
             counts[7] = max(0, counts[7] + delta)
 
         games = sum(counts.values())
@@ -899,9 +893,7 @@ async def stats(interaction: discord.Interaction, user: Optional[str] = None):
             else:
                 med = (flat_sorted[n//2 - 1] + flat_sorted[n//2]) / 2.0
 
-        # output
         buckets = " • ".join([f"{lbl}: {counts[i]}" for i, lbl in enumerate([None,"1","2","3","4","5","6","X"]) if i])
-        # Incomplete games (retcon)
         inc_line = f"Incomplete games (retcon): {abs(delta)}" if delta < 0 else "Incomplete games (retcon): 0"
         text = (
             f"**Stats — {target_label}**\n"
@@ -915,7 +907,28 @@ async def stats(interaction: discord.Interaction, user: Optional[str] = None):
         traceback.print_exc()
         await interaction.followup.send("Error generating stats.")
 
-# ---- Public: Histogram (/plot)
+# ---- Helpers for bar labels
+def _annotate_bars(ax, rects, values, fmt=lambda v: str(v), min_show: float = 0.0):
+    """
+    Place text labels centered above each bar.
+    - rects: list of Rectangle patches
+    - values: same-length list of numeric values to display
+    - fmt: formatter returning a string
+    - min_show: don't show labels for values <= min_show
+    """
+    for rect, val in zip(rects, values):
+        if val is None or val <= min_show:
+            continue
+        height = rect.get_height()
+        ax.annotate(
+            fmt(val),
+            xy=(rect.get_x() + rect.get_width() / 2, height),
+            xytext=(0, 2),  # offset in points
+            textcoords="offset points",
+            ha="center", va="bottom", fontsize=8,
+        )
+
+# ---- Public: Histogram (/plot) with value labels
 @tree.command(name="plot", description="Histogram of guess counts per user")
 async def plot_histogram(interaction: discord.Interaction, top_n: Optional[int] = None):
     await ensure_daily_backfill(interaction)
@@ -962,41 +975,44 @@ async def plot_histogram(interaction: discord.Interaction, top_n: Optional[int] 
 
         # Wider canvas scaling with user count
         fig_w = min(28, 10 + n_users * 1.2)
-        fig_h = 8.5
-        plt.figure(figsize=(fig_w, fig_h))
+        fig_h = 9.5  # a tad taller for labels + legend
+        fig, ax = plt.subplots(figsize=(fig_w, fig_h))
 
-        # Build colored bars and legend with avatar colors
-        handles = []
-        labels = []
+        handles, labels = [], []
+        max_y = 0
         for i, (avg, _key, d) in enumerate(ranked):
             counts = [d["counts"].get(g, 0) for g in guesses]
             xs = [c + (i - (n_users-1)/2)*width for c in centers]
             uid = d["uid"] or 0
             color = get_user_color(interaction.guild, uid) if uid else None
-            plt.bar(xs, counts, width=width, label=f"{d['label']} (avg {avg:.2f})", color=color)
+            bars = ax.bar(xs, counts, width=width, label=f"{d['label']} (avg {avg:.2f})", color=color)
+            _annotate_bars(ax, bars, counts, fmt=lambda v: f"{int(v)}", min_show=0.0)
+            max_y = max(max_y, max(counts) if counts else 0)
             handles.append(Patch(color=color if color else 'tab:blue'))
             labels.append(f"{d['label']} (avg {avg:.2f})")
 
-        plt.xticks(centers, [1,2,3,4,5,6,"X"])
-        plt.xlabel("Guesses (X = fail)")
-        plt.ylabel("Count")
-        plt.title(f"Guess histogram ({n_users} users)")
+        ax.set_xticks(centers, [1,2,3,4,5,6,"X"])
+        ax.set_xlabel("Guesses (X = fail)")
+        ax.set_ylabel("Count")
+        ax.set_title(f"Guess histogram ({n_users} users)")
+        # Headroom for labels
+        ax.set_ylim(top=max_y * 1.15 + 0.5)
 
         ncols = max(2, min(n_users, 6))
-        plt.legend(handles=handles, labels=labels, loc="upper center", bbox_to_anchor=(0.5, -0.14), ncol=ncols, frameon=False)
-        plt.tight_layout()
+        ax.legend(handles=handles, labels=labels, loc="upper center", bbox_to_anchor=(0.5, -0.14), ncol=ncols, frameon=False)
+        fig.tight_layout()
 
         buf = io.BytesIO()
-        plt.savefig(buf, format="png", dpi=180, bbox_inches="tight")
+        fig.savefig(buf, format="png", dpi=180, bbox_inches="tight")
         buf.seek(0)
         await interaction.followup.send(file=discord.File(buf, "hist.png"))
-        plt.close()
+        plt.close(fig)
     except Exception:
         traceback.print_exc()
         await interaction.followup.send("Error generating histogram.")
 
-# ---- Public: Normalized histogram (/plot_normalized)
-@tree.command(name="plot_normalized", description="Histogram normalized per user (shares)")
+# ---- Public: Normalized histogram (/plot_normalized) with percent labels
+@tree.command(name="plot_normalized", description="Histogram normalized per user (percent)")
 async def plot_normalized(interaction: discord.Interaction, top_n: Optional[int] = None):
     await ensure_daily_backfill(interaction)
     if not await safe_defer(interaction, ephemeral=False): return
@@ -1042,34 +1058,39 @@ async def plot_normalized(interaction: discord.Interaction, top_n: Optional[int]
         centers = list(range(len(guesses)))
 
         fig_w = min(28, 10 + n_users * 1.2)
-        fig_h = 8.5
-        plt.figure(figsize=(fig_w, fig_h))
+        fig_h = 9.5
+        fig, ax = plt.subplots(figsize=(fig_w, fig_h))
 
-        handles = []
-        labels = []
+        handles, labels = [], []
+        max_y = 0.0
         for i, (avg, _key, d, total) in enumerate(ranked):
             shares = [(d["counts"].get(g, 0) / total) for g in guesses]
+            percents = [s*100.0 for s in shares]
             xs = [c + (i - (n_users-1)/2)*width for c in centers]
             uid = d["uid"] or 0
             color = get_user_color(interaction.guild, uid) if uid else None
-            plt.bar(xs, shares, width=width, label=f"{d['label']} (avg {avg:.2f})", color=color)
+            bars = ax.bar(xs, percents, width=width, label=f"{d['label']} (avg {avg:.2f})", color=color)
+            _annotate_bars(ax, bars, percents, fmt=lambda v: f"{v:.0f}%", min_show=0.5)  # hide super tiny labels
+            max_y = max(max_y, max(percents) if percents else 0.0)
             handles.append(Patch(color=color if color else 'tab:blue'))
             labels.append(f"{d['label']} (avg {avg:.2f})")
 
-        plt.xticks(centers, [1,2,3,4,5,6,"X"])
-        plt.xlabel("Guesses (X = fail)")
-        plt.ylabel("Share")
-        plt.title(f"Guess histogram (normalized) ({n_users} users)")
+        ax.set_xticks(centers, [1,2,3,4,5,6,"X"])
+        ax.set_xlabel("Guesses (X = fail)")
+        ax.set_ylabel("Percent")
+        ax.set_title(f"Guess histogram (normalized) ({n_users} users)")
+        # Headroom for labels
+        ax.set_ylim(0, max(100.0, max_y * 1.15 + 2.0))
 
         ncols = max(2, min(n_users, 6))
-        plt.legend(handles=handles, labels=labels, loc="upper center", bbox_to_anchor=(0.5, -0.14), ncol=ncols, frameon=False)
-        plt.tight_layout()
+        ax.legend(handles=handles, labels=labels, loc="upper center", bbox_to_anchor=(0.5, -0.14), ncol=ncols, frameon=False)
+        fig.tight_layout()
 
         buf = io.BytesIO()
-        plt.savefig(buf, format="png", dpi=180, bbox_inches="tight")
+        fig.savefig(buf, format="png", dpi=180, bbox_inches="tight")
         buf.seek(0)
         await interaction.followup.send(file=discord.File(buf, "hist_normalized.png"))
-        plt.close()
+        plt.close(fig)
     except Exception:
         traceback.print_exc()
         await interaction.followup.send("Error generating normalized histogram.")
@@ -1098,7 +1119,10 @@ async def retcon(interaction: discord.Interaction, user: discord.Member, action:
     new_delta = apply_retcon(user.id, change)
     # Public confirmation
     verb = "removed" if action == "remove" else "added"
-    await interaction.response.send_message(f"{user.mention}: {verb} {c} X (retcon). New incomplete-games delta: {new_delta}", ephemeral=False)
+    await interaction.response.send_message(
+        f"{user.mention}: {verb} {c} X (retcon). New incomplete-games delta: {new_delta}",
+        ephemeral=False,
+    )
 
 # ---- Admin: manual rescan (ephemeral)
 @tree.command(description="Re-parse last N messages.")
