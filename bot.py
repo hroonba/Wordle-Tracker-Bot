@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import os, io, re, sqlite3, datetime as dt, traceback, unicodedata, difflib
+import os, io, re, sqlite3, datetime as dt, traceback, unicodedata, difflib, json, math
 from dataclasses import dataclass
 from typing import Optional, List, Tuple, Dict
 
@@ -8,17 +8,23 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
-# Load .env locally; on Render, env vars come from the dashboard.
+# Optional .env locally; in Render, env vars come from dashboard.
 try:
     from dotenv import load_dotenv
     load_dotenv()
 except Exception:
     pass
 
-# Headless plotting for servers
+# Headless plotting
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from matplotlib.patches import Patch
+
+# Avatar color support
+import requests
+from PIL import Image
+from io import BytesIO
 
 
 # ========= Config =========
@@ -26,14 +32,16 @@ TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 GUILD_ID = os.getenv("GUILD_ID")  # string; we'll int() later if present
 OWNER_ID = int(os.getenv("OWNER_ID") or "0")
 
-WORDLE_CHANNEL_ID = int(os.getenv("WORDLE_CHANNEL_ID") or "0")   # optional scope
-WORDLE_BOT_ID = int(os.getenv("WORDLE_BOT_ID") or "0")           # recommended
+WORDLE_CHANNEL_ID = int(os.getenv("WORDLE_CHANNEL_ID") or "0")   # optional channel scope
+WORDLE_BOT_ID = int(os.getenv("WORDLE_BOT_ID") or "0")           # optional, but recommended
 DB_PATH = os.getenv("DB_PATH") or "wordle_scores.db"
 MAX_BACKFILL = int(os.getenv("MAX_BACKFILL") or "1500")
 
+ALIASES_FILE = os.getenv("ALIASES_FILE") or "aliases.json"       # file-based aliases
+
 INTENTS = discord.Intents.default()
 INTENTS.message_content = True
-INTENTS.members = True  # we rely on member lists for name matching
+INTENTS.members = True  # needed for robust name matching + avatars
 
 
 # ========= DB =========
@@ -60,15 +68,22 @@ def init_db():
             );
             """
         )
-
-def init_aliases_db():
-    with sqlite3.connect(DB_PATH) as con:
-        con.execute("""
-        CREATE TABLE IF NOT EXISTS aliases (
-            name_norm  TEXT PRIMARY KEY,   -- normalize_username(name)
-            user_id    INTEGER NOT NULL
-        );
-        """)
+        con.execute(
+            """
+            CREATE TABLE IF NOT EXISTS aliases (
+                name_norm  TEXT PRIMARY KEY,   -- normalize_username(name)
+                user_id    INTEGER NOT NULL
+            );
+            """
+        )
+        con.execute(
+            """
+            CREATE TABLE IF NOT EXISTS retcons (
+                user_id   INTEGER PRIMARY KEY,
+                delta_x   INTEGER NOT NULL  -- can be 0 or negative; never positive overall
+            );
+            """
+        )
 
 def kv_get(key: str) -> Optional[str]:
     with sqlite3.connect(DB_PATH) as con:
@@ -101,91 +116,39 @@ def upsert_score(user_id: int, username: str, day: int, score: Optional[int], so
             ),
         )
 
-def fetch_scores(days_back: Optional[int] = None, user_id: Optional[int] = None) -> List[Tuple]:
+def get_retcon_delta(user_id: int) -> int:
     with sqlite3.connect(DB_PATH) as con:
-        if days_back is None:
-            if user_id:
-                cur = con.execute("""
-                    SELECT user_id, username, day, score, solved, ts
-                      FROM scores
-                     WHERE user_id = ?
-                     ORDER BY user_id, ts ASC;
-                """, (user_id,))
-            else:
-                cur = con.execute("""
-                    SELECT user_id, username, day, score, solved, ts
-                      FROM scores
-                     ORDER BY user_id, ts ASC;
-                """)
-        else:
-            cutoff = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=max(1, days_back) - 1)).isoformat()
-            if user_id:
-                cur = con.execute("""
-                    SELECT user_id, username, day, score, solved, ts
-                      FROM scores
-                     WHERE ts >= ? AND user_id = ?
-                     ORDER BY user_id, ts ASC;
-                """, (cutoff, user_id))
-            else:
-                cur = con.execute("""
-                    SELECT user_id, username, day, score, solved, ts
-                     FROM scores
-                    WHERE ts >= ?
-                    ORDER BY user_id, ts ASC;
-                """, (cutoff,))
+        row = con.execute("SELECT delta_x FROM retcons WHERE user_id=?;", (user_id,)).fetchone()
+        return int(row[0]) if row else 0
+
+def apply_retcon(user_id: int, change: int) -> int:
+    """
+    change: +n or -n step for the user's delta.
+    Enforces invariant: final delta_x <= 0.
+    Returns new delta.
+    """
+    with sqlite3.connect(DB_PATH) as con:
+        row = con.execute("SELECT delta_x FROM retcons WHERE user_id=?;", (user_id,)).fetchone()
+        cur = int(row[0]) if row else 0
+        new_val = cur + change
+        if new_val > 0:  # clamp at 0; never allow positive total delta
+            new_val = 0
+        con.execute("INSERT INTO retcons(user_id, delta_x) VALUES(?, ?) ON CONFLICT(user_id) DO UPDATE SET delta_x=excluded.delta_x;",
+                    (user_id, new_val))
+        return new_val
+
+def fetch_all_scores() -> List[Tuple]:
+    with sqlite3.connect(DB_PATH) as con:
+        cur = con.execute("""
+            SELECT user_id, username, day, score, solved, ts
+              FROM scores
+             ORDER BY user_id, ts ASC;
+        """)
         return list(cur.fetchall())
 
-def fetch_leaderboard(days_back: Optional[int] = None, min_games: int = 25) -> List[Tuple]:
-    with sqlite3.connect(DB_PATH) as con:
-        if days_back is None:
-            rows = list(con.execute("""
-                SELECT user_id, username, score, solved, ts
-                  FROM scores
-                 ORDER BY ts ASC;
-            """))
-        else:
-            cutoff = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=max(1, days_back) - 1)).isoformat()
-            rows = list(con.execute("""
-                SELECT user_id, username, score, solved, ts
-                  FROM scores
-                 WHERE ts >= ?
-                 ORDER BY ts ASC;
-            """, (cutoff,)))
 
-    agg: Dict[tuple, Dict] = {}
-    for uid, uname, score, solved, _ts in rows:
-        key = identity_key(uid or 0, uname or "")
-        label = identity_label(uid or 0, uname or "Unknown")
-        g = agg.setdefault(key, {"label": label, "scores": [], "solves": 0, "misses": 0})
-        if solved == 1:
-            g["scores"].append(score)
-            g["solves"] += 1
-        else:
-            g["misses"] += 1
-
-    out = []
-    for key, g in agg.items():
-        games = len(g["scores"]) + g["misses"]
-        if games < min_games:
-            continue
-        # FIX: include misses as 7's in the average
-        total_points = sum(g["scores"]) + 7 * g["misses"]
-        avg = total_points / games if games > 0 else 7.0
-        out.append((key, g["label"], avg, g["solves"], g["misses"], games))
-
-    out.sort(key=lambda t: (t[2], -t[3]))  # avg asc, solves desc
-    return out
-
-
-# ========= Identity & alias helpers =========
+# ========= Aliases (DB + file) =========
 def normalize_username(s: str) -> str:
-    """
-    Strong normalization for aliasing:
-    - NFKC unicode normalize
-    - strip leading '@', trim
-    - lowercase
-    - remove all non-alphanumeric chars (spaces, punctuation, emoji)
-    """
     s = unicodedata.normalize("NFKC", s or "")
     s = s.strip()
     if s.startswith("@"):
@@ -219,7 +182,6 @@ def alias_list() -> list[tuple[str,int]]:
         return list(con.execute("SELECT name_norm, user_id FROM aliases ORDER BY name_norm;"))
 
 def apply_alias_to_history(name: str, user_id: int, display_name: str):
-    """Retro-migrate user_id==0 rows whose normalized username matches."""
     n = normalize_username(name)
     with sqlite3.connect(DB_PATH) as con:
         rows = list(con.execute("SELECT rowid, user_id, username, day, score, solved, ts FROM scores WHERE user_id = 0;"))
@@ -237,8 +199,41 @@ def apply_alias_to_history(name: str, user_id: int, display_name: str):
                 """, (user_id, display_name, day, score, solved, ts))
         con.commit()
 
+def load_aliases_file(guild: Optional[discord.Guild] = None) -> int:
+    """
+    Load aliases from aliases.json:
+    { "aliases": [ { "name": "scoopthusiast", "user_id": 123 }, ... ] }
+    Returns count imported/updated.
+    """
+    if not os.path.exists(ALIASES_FILE):
+        return 0
+    try:
+        with open(ALIASES_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        items = data.get("aliases", [])
+        count = 0
+        for it in items:
+            name = it.get("name", "")
+            uid = int(it.get("user_id", 0))
+            if not name or not uid:
+                continue
+            alias_set(name, uid)
+            # retro-migrate history for this alias
+            display = None
+            if guild:
+                m = guild.get_member(uid)
+                if m and m.display_name:
+                    display = m.display_name
+            apply_alias_to_history(name, uid, display or name)
+            count += 1
+        return count
+    except Exception:
+        traceback.print_exc()
+        return 0
+
+
+# ========= Identity helpers =========
 def identity_key(user_id: int, username: str) -> tuple:
-    """Prefer real user_id; otherwise try alias; then fall back to normalized name."""
     if user_id:
         return (user_id, "")
     mapped = alias_lookup(username)
@@ -247,7 +242,6 @@ def identity_key(user_id: int, username: str) -> tuple:
     return (0, normalize_username(username))
 
 def identity_label(user_id: int, username: str) -> str:
-    """Label used in text (mentions are fine there)."""
     if user_id:
         return f"<@{user_id}>"
     mapped = alias_lookup(username)
@@ -256,7 +250,6 @@ def identity_label(user_id: int, username: str) -> str:
     return username or "Unknown"
 
 def label_plain_for_hist(guild: discord.Guild | None, user_id: int, username: str) -> str:
-    """Legend label: prefer readable display names (no <@id>)."""
     if user_id:
         if guild:
             m = guild.get_member(user_id)
@@ -278,7 +271,6 @@ def label_plain_for_hist(guild: discord.Guild | None, user_id: int, username: st
 MEMBER_INDEX: Dict[int, Dict[str, Tuple[int, str]]] = {}
 
 async def build_member_index(guild: discord.Guild):
-    """Fetch and index all members so fuzzy-matching has complete data."""
     try:
         async for _ in guild.fetch_members(limit=None):
             pass
@@ -306,7 +298,6 @@ def member_index_lookup(guild: discord.Guild | None, norm: str) -> Optional[Tupl
 
 # ========= Matching helpers =========
 def resolve_name_to_member(guild: discord.Guild | None, name: str) -> tuple[int, str]:
-    """Resolve a plain name to (user_id, display_name) via index, guild lists, or alias."""
     if not guild:
         return 0, name
     target = normalize_username(name)
@@ -330,12 +321,6 @@ def resolve_name_to_member(guild: discord.Guild | None, name: str) -> tuple[int,
     return 0, name
 
 def detect_names_in_free_text(guild: discord.Guild | None, text: str) -> list[tuple[int, str]]:
-    """
-    Fallback extractor for lines with no real mentions and no '@'.
-    Scans text and returns unique (user_id, display_name) hits for:
-      - guild member display names (via MEMBER_INDEX)
-      - alias names
-    """
     hits: list[tuple[int, str]] = []
     if not text:
         return hits
@@ -366,10 +351,6 @@ def best_match_member_or_alias(
     raw_name: str,
     ratio_threshold: float = 0.72
 ) -> tuple[int, str]:
-    """
-    Given a raw name fragment (from an '@' segment), return (user_id, display_name)
-    using normalized exact and fuzzy matching over the member index and alias table.
-    """
     cleaned = raw_name.strip()
     cleaned = re.sub(r"[^A-Za-z0-9'’ _-]+", " ", cleaned)
     cleaned = re.sub(r"\s+", " ", cleaned).strip()
@@ -443,14 +424,6 @@ def _extract_day_from_message(msg: discord.Message) -> Optional[int]:
     return None
 
 def parse_group_summary_style(msg: discord.Message) -> List[ParsedScore]:
-    """
-    Supports lines like:
-      '👑 2/6: @Name'
-      '5/6: <@123> <@456> ...'
-      '4/6: @Name One @Name Two'  (plain text with '@' but no real mentions)
-      '3/6: Name One Name Two'    (no '@', no mentions)
-    If Wordle number missing, infer "yesterday UTC" as YYYYMMDD.
-    """
     day = _extract_day_from_message(msg)
     if day is None:
         d = (msg.created_at - dt.timedelta(days=1)).date()
@@ -468,7 +441,7 @@ def parse_group_summary_style(msg: discord.Message) -> List[ParsedScore]:
         score_val = None if raw_score.lower() == "x" else int(raw_score)
         solved = score_val is not None
 
-        # 1) Real mentions — record them, strip them, and keep parsing leftovers
+        # 1) Real mentions
         mention_ids = [int(mm.group("id")) for mm in re.finditer(r"<@!?(?P<id>\d+)>", rest)]
         if mention_ids:
             id_to_member = {mem.id: mem for mem in msg.mentions}
@@ -487,7 +460,7 @@ def parse_group_summary_style(msg: discord.Message) -> List[ParsedScore]:
                 out.append(ParsedScore(user_id=uid, username=label, day=day, score=score_val, solved=solved))
             continue
 
-        # 3) No '@' left — free-text multi-name scan
+        # 3) Free-text fallback
         if rest:
             detected = detect_names_in_free_text(msg.guild, rest)
             if detected:
@@ -521,7 +494,6 @@ async def safe_defer(interaction: discord.Interaction, *, ephemeral: bool = True
         return False
 
 async def do_rescan_channel(channel: discord.abc.Messageable, limit: int) -> int:
-    """Scan channel history and ingest messages."""
     parsed = 0
     if not isinstance(channel, (discord.TextChannel, discord.Thread)):
         return parsed
@@ -562,15 +534,58 @@ async def ensure_daily_backfill(interaction: discord.Interaction) -> None:
     try:
         count = await do_rescan_channel(channel, MAX_BACKFILL)
         kv_set("last_backfill_ymd", today_ymd)
-        print(f"Auto-backfill ran: parsed {count} message items; set day={today_ymd}")
+        print(f"Auto-backfill ran: parsed {count} items; set day={today_ymd}")
     except Exception:
         traceback.print_exc()
 
 
+# ========= Avatar colors (cached) =========
+_AVATAR_COLOR_CACHE: Dict[int, Tuple[float,float,float]] = {}
+
+def _dominant_color_from_bytes(b: bytes) -> Tuple[float,float,float]:
+    img = Image.open(BytesIO(b)).convert("RGB")
+    img = img.resize((32, 32))
+    # Simple average color
+    pixels = list(img.getdata())
+    r = sum(p[0] for p in pixels) / len(pixels)
+    g = sum(p[1] for p in pixels) / len(pixels)
+    b_ = sum(p[2] for p in pixels) / len(pixels)
+    # Return normalized matplotlib RGB [0,1]
+    return (r/255.0, g/255.0, b_/255.0)
+
+def get_user_color(guild: Optional[discord.Guild], user_id: int) -> Tuple[float,float,float]:
+    if user_id in _AVATAR_COLOR_CACHE:
+        return _AVATAR_COLOR_CACHE[user_id]
+    # Fallback deterministic pastel if anything fails
+    def fallback(uid: int) -> Tuple[float,float,float]:
+        h = (uid % 360) / 360.0
+        # simple HSV->RGB-ish pastel
+        r = 0.5 + 0.4*math.sin(2*math.pi*h)
+        g = 0.5 + 0.4*math.sin(2*math.pi*(h+1/3))
+        b = 0.5 + 0.4*math.sin(2*math.pi*(h+2/3))
+        return (max(0,min(1,r)), max(0,min(1,g)), max(0,min(1,b)))
+
+    try:
+        if guild:
+            m = guild.get_member(user_id)
+            if m:
+                url = m.display_avatar.replace(size=64).url
+                r = requests.get(url, timeout=5)
+                if r.ok:
+                    col = _dominant_color_from_bytes(r.content)
+                    _AVATAR_COLOR_CACHE[user_id] = col
+                    return col
+    except Exception:
+        pass
+    col = fallback(user_id)
+    _AVATAR_COLOR_CACHE[user_id] = col
+    return col
+
+
+# ========= Events =========
 @bot.event
 async def on_ready():
     init_db()
-    init_aliases_db()
     try:
         if GUILD_ID:
             guild_obj = discord.Object(id=int(GUILD_ID))
@@ -583,10 +598,10 @@ async def on_ready():
     except Exception as e:
         print("Slash sync error:", repr(e))
 
-    # Build member indexes for all guilds the bot is in
     try:
         for g in bot.guilds:
             await build_member_index(g)
+            load_aliases_file(g)  # import file aliases on boot
             print(f"Indexed {len(MEMBER_INDEX.get(g.id, {}))} members for guild {g.id}")
     except Exception:
         traceback.print_exc()
@@ -596,6 +611,7 @@ async def on_ready():
 @bot.event
 async def on_guild_join(guild: discord.Guild):
     await build_member_index(guild)
+    load_aliases_file(guild)
 
 @bot.event
 async def on_guild_available(guild: discord.Guild):
@@ -619,17 +635,13 @@ async def on_message(message: discord.Message):
         return
     if not message_in_scope(message):
         return
-
-    # Parse daily summary from the Wordle bot
     try:
-        if (WORDLE_BOT_ID and message.author.id == WORDLE_BOT_ID) or \
-           (not WORDLE_BOT_ID and message.author.bot):
+        if (WORDLE_BOT_ID and message.author.id == WORDLE_BOT_ID) or (not WORDLE_BOT_ID and message.author.bot):
             for p in parse_group_summary_style(message):
                 upsert_score(p.user_id or 0, p.username, p.day, p.score, p.solved)
     except Exception:
         traceback.print_exc()
 
-    # Parse human shares like "Wordle 1558 3/6"
     try:
         m = re.search(r"\bWordle\s+(?P<day>\d+)\s+(?P<score>[Xx]|\d)\/6\b",
                       message.content or "", re.IGNORECASE)
@@ -666,18 +678,13 @@ async def ping(interaction: discord.Interaction):
         await interaction.response.send_message("Pong!", ephemeral=True)
 
 @tree.command(description="Admin: resync/clear application commands")
-@app_commands.describe(
-    scope="Use one of: guild (default), global, purge_guild, purge_global"
-)
+@app_commands.describe(scope="Use one of: guild (default), global, purge_guild, purge_global")
 async def sync(interaction: discord.Interaction, scope: Optional[str] = "guild"):
     if OWNER_ID and interaction.user.id != OWNER_ID:
         await interaction.response.send_message("Not authorized.", ephemeral=True)
         return
-
     scope = (scope or "guild").lower()
-
-    if not await safe_defer(interaction, ephemeral=True):
-        return
+    if not await safe_defer(interaction, ephemeral=True): return
     try:
         if scope == "guild":
             if not interaction.guild:
@@ -687,11 +694,9 @@ async def sync(interaction: discord.Interaction, scope: Optional[str] = "guild")
             tree.copy_global_to(guild=guild_obj)
             out = await tree.sync(guild=guild_obj)
             await interaction.followup.send(f"Synced {len(out)} command(s) to this guild.", ephemeral=True)
-
         elif scope == "global":
             out = await tree.sync()
             await interaction.followup.send(f"Synced {len(out)} global command(s).", ephemeral=True)
-
         elif scope == "purge_guild":
             if not interaction.guild:
                 await interaction.followup.send("Run in a server.", ephemeral=True)
@@ -702,26 +707,22 @@ async def sync(interaction: discord.Interaction, scope: Optional[str] = "guild")
             tree.copy_global_to(guild=guild_obj)
             out = await tree.sync(guild=guild_obj)
             await interaction.followup.send(f"Purged and re-synced guild commands ({len(out)}).", ephemeral=True)
-
         elif scope == "purge_global":
             tree.clear_commands()
             await tree.sync()
             await interaction.followup.send("Purged all GLOBAL commands from Discord.", ephemeral=True)
-
         else:
-            await interaction.followup.send("Unknown scope. Use guild, global, purge_guild, or purge_global.", ephemeral=True)
-
+            await interaction.followup.send("Unknown scope.", ephemeral=True)
     except Exception as e:
         traceback.print_exc()
         await interaction.followup.send(f"Sync error: {e!r}", ephemeral=True)
 
-# ---- Alias management (ephemeral)
+# ---- Alias controls
 @tree.command(description="Admin: add an alias mapping (old nickname -> @user)")
-@app_commands.describe(name="The old display name as it appears in summaries", user="The real user to map to")
+@app_commands.describe(name="Old display name as it appears in summaries", user="The real user")
 async def alias_add(interaction: discord.Interaction, name: str, user: discord.Member):
     if OWNER_ID and interaction.user.id != OWNER_ID:
-        await interaction.response.send_message("Not authorized.", ephemeral=True)
-        return
+        await interaction.response.send_message("Not authorized.", ephemeral=True); return
     if not await safe_defer(interaction, ephemeral=True): return
     try:
         alias_set(name, user.id)
@@ -734,8 +735,7 @@ async def alias_add(interaction: discord.Interaction, name: str, user: discord.M
 @tree.command(description="Admin: remove an alias by name")
 async def alias_remove(interaction: discord.Interaction, name: str):
     if OWNER_ID and interaction.user.id != OWNER_ID:
-        await interaction.response.send_message("Not authorized.", ephemeral=True)
-        return
+        await interaction.response.send_message("Not authorized.", ephemeral=True); return
     if not await safe_defer(interaction, ephemeral=True): return
     try:
         alias_delete(name)
@@ -747,14 +747,12 @@ async def alias_remove(interaction: discord.Interaction, name: str):
 @tree.command(description="Admin: list aliases")
 async def alias_list_cmd(interaction: discord.Interaction):
     if OWNER_ID and interaction.user.id != OWNER_ID:
-        await interaction.response.send_message("Not authorized.", ephemeral=True)
-        return
+        await interaction.response.send_message("Not authorized.", ephemeral=True); return
     if not await safe_defer(interaction, ephemeral=True): return
     try:
         items = alias_list()
         if not items:
-            await interaction.followup.send("No aliases.", ephemeral=True)
-            return
+            await interaction.followup.send("No aliases.", ephemeral=True); return
         lines = ["**Aliases:**"]
         for name_norm, uid in items:
             label = name_norm
@@ -768,49 +766,182 @@ async def alias_list_cmd(interaction: discord.Interaction):
         traceback.print_exc()
         await interaction.followup.send(f"Alias list error: {e!r}", ephemeral=True)
 
-# ---- Leaderboard (PUBLIC; entire history default) + auto daily backfill
-@tree.command(description="Show leaderboard for the entire history (or last N days).")
-@app_commands.describe(days="Optional: limit to last N days. Omit for entire history.")
-async def leaderboard(interaction: discord.Interaction, days: Optional[int] = None):
-    await ensure_daily_backfill(interaction)
-    if not await safe_defer(interaction, ephemeral=False):
-        return
+@tree.command(description="Admin: reload aliases.json and apply to history")
+async def alias_reload(interaction: discord.Interaction):
+    if OWNER_ID and interaction.user.id != OWNER_ID:
+        await interaction.response.send_message("Not authorized.", ephemeral=True); return
+    if not await safe_defer(interaction, ephemeral=True): return
     try:
-        rows = fetch_leaderboard(days_back=days)
+        n = load_aliases_file(interaction.guild)
+        await interaction.followup.send(f"Reloaded aliases.json (imported/updated {n}).", ephemeral=True)
+    except Exception as e:
+        traceback.print_exc()
+        await interaction.followup.send(f"Alias reload error: {e!r}", ephemeral=True)
+
+# ---- Public: Leaderboard (entire history; min 20 games)
+@tree.command(description="Leaderboard")
+async def leaderboard(interaction: discord.Interaction):
+    await ensure_daily_backfill(interaction)
+    if not await safe_defer(interaction, ephemeral=False): return
+    try:
+        rows = fetch_all_scores()
         if not rows:
-            await interaction.followup.send("No data yet.")
-            return
-        title = "entire history" if days is None else f"last {days} days"
-        lines = [f"**Leaderboard ({title})**\n_Min 25 games to rank_"]
-        for rank, (_key, label, avg, solves, misses, games) in enumerate(rows, 1):
-            lines.append(f"#{rank} {label}: avg {avg:.2f} (solves {solves}, X {misses}, games {games})")
+            await interaction.followup.send("No data yet."); return
+
+        # Aggregate
+        agg: Dict[tuple, Dict] = {}
+        for uid, uname, _day, score, solved, _ts in rows:
+            key = identity_key(uid or 0, uname or "")
+            label = identity_label(uid or 0, uname or "Unknown")
+            g = agg.setdefault(key, {"label": label, "solved_scores": [], "misses": 0, "uid": uid or 0, "uname": uname})
+            if solved == 1:
+                g["solved_scores"].append(score)
+            else:
+                g["misses"] += 1
+
+        # Apply retcon deltas and build output
+        out = []
+        for key, g in agg.items():
+            uid_guess = key[0] if key[0] else alias_lookup(g["uname"])
+            delta = get_retcon_delta(uid_guess) if uid_guess else 0
+            effective_misses = max(0, g["misses"] + delta)  # delta <= 0
+            games = len(g["solved_scores"]) + effective_misses
+            if games < 20:
+                continue
+            total_points = sum(g["solved_scores"]) + 7 * effective_misses
+            avg = total_points / games if games > 0 else 7.0
+            out.append((avg, g["label"], len(g["solved_scores"]), effective_misses, games))
+
+        out.sort(key=lambda t: (t[0], -t[2]))  # avg asc, solves desc
+        if not out:
+            await interaction.followup.send("No one meets the minimum games (20)."); return
+
+        lines = ["**Leaderboard**\n_Min 20 games to rank_"]
+        for i, (avg, label, solves, misses, games) in enumerate(out, 1):
+            lines.append(f"#{i} {label}: avg {avg:.2f} (solves {solves}, X {misses}, games {games})")
         await interaction.followup.send("\n".join(lines))
     except Exception:
         traceback.print_exc()
         await interaction.followup.send("Error generating leaderboard.")
 
-# ---- Plot (PUBLIC histogram; entire history default) + auto daily backfill
-@tree.command(name="plot", description="Histogram of guess counts per user (ranked by avg).")
-@app_commands.describe(days="Optional: limit to last N days (omit for entire history).",
-                       top_n="Optional: show only top N users by average")
-async def plot_histogram(interaction: discord.Interaction, days: Optional[int] = None, top_n: Optional[int] = None):
+# ---- Public: Stats (single user)
+@tree.command(description="Stats for a single player")
+@app_commands.describe(user="Mention the user or type a name to match")
+async def stats(interaction: discord.Interaction, user: Optional[str] = None):
     await ensure_daily_backfill(interaction)
-    if not await safe_defer(interaction, ephemeral=False):
-        return
+    if not await safe_defer(interaction, ephemeral=False): return
     try:
-        rows = fetch_scores(days_back=days)
+        # Resolve user
+        target_id = 0; target_label = ""
+        if interaction.guild and interaction.data and "resolved" in interaction.data:
+            pass  # standard resolution handled when using mention-type option (not used here)
+
+        member_obj: Optional[discord.Member] = None
+        if interaction.guild and user and user.startswith("<@") and user.endswith(">"):
+            try:
+                num = int(re.sub(r"[<@!>]", "", user))
+                member_obj = interaction.guild.get_member(num)
+            except Exception:
+                member_obj = None
+        if not member_obj and interaction.guild and user:
+            uid, label = best_match_member_or_alias(interaction.guild, user)
+            if uid:
+                member_obj = interaction.guild.get_member(uid)
+                target_id, target_label = uid, (member_obj.display_name if member_obj else label)
+            else:
+                target_label = label
+        if member_obj:
+            target_id = member_obj.id
+            target_label = member_obj.display_name or member_obj.name
+
+        if not target_id:
+            # fallback to the invoker
+            target_id = interaction.user.id
+            target_label = interaction.user.display_name or interaction.user.name
+
+        rows = fetch_all_scores()
+        user_rows = [(uid, uname, day, score, solved, ts) for (uid, uname, day, score, solved, ts) in rows
+                     if (uid == target_id) or (uid == 0 and alias_lookup(uname) == target_id)]
+
+        if not user_rows:
+            await interaction.followup.send(f"No scores found for **{target_label}**."); return
+
+        # Tally
+        counts = {i: 0 for i in range(1, 8)}  # 1..6 + 7 (X)
+        solved_scores = []
+        for _uid, _uname, _day, score, solved, _ts in user_rows:
+            if solved == 1:
+                solved_scores.append(score)
+                counts[score] += 1
+            else:
+                counts[7] += 1
+
+        delta = get_retcon_delta(target_id)
+        if delta < 0:
+            # reduce X bin but never below 0
+            counts[7] = max(0, counts[7] + delta)
+
+        games = sum(counts.values())
+        wins = games - counts[7]
+        fails = counts[7]
+
+        # Average/median with X=7
+        flat = []
+        for g, c in counts.items():
+            flat.extend([g]*c)
+        avg = (sum(flat) / len(flat)) if flat else 7.0
+        med = 7
+        if flat:
+            flat_sorted = sorted(flat)
+            n = len(flat_sorted)
+            if n % 2 == 1:
+                med = flat_sorted[n//2]
+            else:
+                med = (flat_sorted[n//2 - 1] + flat_sorted[n//2]) / 2.0
+
+        # output
+        buckets = " • ".join([f"{lbl}: {counts[i]}" for i, lbl in enumerate([None,"1","2","3","4","5","6","X"]) if i])
+        # Incomplete games (retcon)
+        inc_line = f"Incomplete games (retcon): {abs(delta)}" if delta < 0 else "Incomplete games (retcon): 0"
+        text = (
+            f"**Stats — {target_label}**\n"
+            f"Games: {games}  •  Wins: {wins}  •  Fails: {fails}\n"
+            f"Average: {avg:.2f}  •  Median: {med if isinstance(med,int) else f'{med:.2f}'}\n"
+            f"{inc_line}\n\n"
+            f"Guess counts:\n{buckets}"
+        )
+        await interaction.followup.send(text)
+    except Exception:
+        traceback.print_exc()
+        await interaction.followup.send("Error generating stats.")
+
+# ---- Public: Histogram (/plot)
+@tree.command(name="plot", description="Histogram of guess counts per user")
+async def plot_histogram(interaction: discord.Interaction, top_n: Optional[int] = None):
+    await ensure_daily_backfill(interaction)
+    if not await safe_defer(interaction, ephemeral=False): return
+    try:
+        rows = fetch_all_scores()
         if not rows:
-            await interaction.followup.send("No scores found.")
-            return
+            await interaction.followup.send("No scores found."); return
 
         per_user: Dict[tuple, Dict] = {}
         for uid, uname, _day, score, solved, _ts in rows:
             key = identity_key(uid or 0, uname or "")
             label = label_plain_for_hist(interaction.guild, uid or 0, uname or "Unknown")
-            entry = per_user.setdefault(key, {"label": label, "counts": {i:0 for i in range(1,8)}})
+            entry = per_user.setdefault(key, {"label": label, "uid": (uid or alias_lookup(uname)), "counts": {i:0 for i in range(1,8)}})
             s = (score if solved == 1 else 7)
             entry["counts"][s] += 1
 
+        # Apply retcon deltas to X bin
+        for key, d in per_user.items():
+            uid = d["uid"]
+            if uid:
+                delta = get_retcon_delta(uid)
+                if delta < 0:
+                    d["counts"][7] = max(0, d["counts"][7] + delta)
+
+        # Rank by avg and optionally clip to top_n
         ranked = []
         for key, d in per_user.items():
             flat = []
@@ -818,30 +949,41 @@ async def plot_histogram(interaction: discord.Interaction, days: Optional[int] =
                 flat.extend([g]*c)
             if not flat:
                 continue
-            avg = sum(flat)/len(flat)  # X already counted as 7 in flat
+            avg = sum(flat)/len(flat)
             ranked.append((avg, key, d))
         ranked.sort(key=lambda t: t[0])
         if top_n:
             ranked = ranked[: top_n]
 
         guesses = list(range(1, 8))  # 1..6 + 7=X
-        width = 0.8 / max(1, len(ranked))
+        n_users = max(1, len(ranked))
+        width = 0.8 / n_users
         centers = list(range(len(guesses)))
 
-        plt.figure(figsize=(12, 7))
+        # Wider canvas scaling with user count
+        fig_w = min(28, 10 + n_users * 1.2)
+        fig_h = 8.5
+        plt.figure(figsize=(fig_w, fig_h))
+
+        # Build colored bars and legend with avatar colors
+        handles = []
+        labels = []
         for i, (avg, _key, d) in enumerate(ranked):
             counts = [d["counts"].get(g, 0) for g in guesses]
-            xs = [c + (i - (len(ranked)-1)/2)*width for c in centers]
-            plt.bar(xs, counts, width=width, label=f"{d['label']} (avg {avg:.2f})")
+            xs = [c + (i - (n_users-1)/2)*width for c in centers]
+            uid = d["uid"] or 0
+            color = get_user_color(interaction.guild, uid) if uid else None
+            plt.bar(xs, counts, width=width, label=f"{d['label']} (avg {avg:.2f})", color=color)
+            handles.append(Patch(color=color if color else 'tab:blue'))
+            labels.append(f"{d['label']} (avg {avg:.2f})")
 
         plt.xticks(centers, [1,2,3,4,5,6,"X"])
         plt.xlabel("Guesses (X = fail)")
         plt.ylabel("Count")
-        title_scope = "entire history" if days is None else f"last {days} days"
-        audience = f"(top {len(ranked)} by avg)" if top_n else f"({len(ranked)} users)"
-        plt.title(f"Guess histogram — {title_scope} {audience}")
-        ncols = max(2, min(len(ranked), 6))
-        plt.legend(loc="upper center", bbox_to_anchor=(0.5, -0.15), ncol=ncols)
+        plt.title(f"Guess histogram ({n_users} users)")
+
+        ncols = max(2, min(n_users, 6))
+        plt.legend(handles=handles, labels=labels, loc="upper center", bbox_to_anchor=(0.5, -0.14), ncol=ncols, frameon=False)
         plt.tight_layout()
 
         buf = io.BytesIO()
@@ -853,21 +995,122 @@ async def plot_histogram(interaction: discord.Interaction, days: Optional[int] =
         traceback.print_exc()
         await interaction.followup.send("Error generating histogram.")
 
-# ---- Rescan/backfill (manual; ephemeral)
+# ---- Public: Normalized histogram (/plot_normalized)
+@tree.command(name="plot_normalized", description="Histogram normalized per user (shares)")
+async def plot_normalized(interaction: discord.Interaction, top_n: Optional[int] = None):
+    await ensure_daily_backfill(interaction)
+    if not await safe_defer(interaction, ephemeral=False): return
+    try:
+        rows = fetch_all_scores()
+        if not rows:
+            await interaction.followup.send("No scores found."); return
+
+        per_user: Dict[tuple, Dict] = {}
+        for uid, uname, _day, score, solved, _ts in rows:
+            key = identity_key(uid or 0, uname or "")
+            label = label_plain_for_hist(interaction.guild, uid or 0, uname or "Unknown")
+            entry = per_user.setdefault(key, {"label": label, "uid": (uid or alias_lookup(uname)), "counts": {i:0 for i in range(1,8)}})
+            s = (score if solved == 1 else 7)
+            entry["counts"][s] += 1
+
+        # Apply retcon deltas to X bin
+        for key, d in per_user.items():
+            uid = d["uid"]
+            if uid:
+                delta = get_retcon_delta(uid)
+                if delta < 0:
+                    d["counts"][7] = max(0, d["counts"][7] + delta)
+
+        # Rank by avg, then normalize counts to shares
+        ranked = []
+        for key, d in per_user.items():
+            total = sum(d["counts"].values())
+            if total == 0:
+                continue
+            flat = []
+            for g, c in d["counts"].items():
+                flat.extend([g]*c)
+            avg = sum(flat)/len(flat)
+            ranked.append((avg, key, d, total))
+        ranked.sort(key=lambda t: t[0])
+        if top_n:
+            ranked = ranked[: top_n]
+
+        guesses = list(range(1, 8))
+        n_users = max(1, len(ranked))
+        width = 0.8 / n_users
+        centers = list(range(len(guesses)))
+
+        fig_w = min(28, 10 + n_users * 1.2)
+        fig_h = 8.5
+        plt.figure(figsize=(fig_w, fig_h))
+
+        handles = []
+        labels = []
+        for i, (avg, _key, d, total) in enumerate(ranked):
+            shares = [(d["counts"].get(g, 0) / total) for g in guesses]
+            xs = [c + (i - (n_users-1)/2)*width for c in centers]
+            uid = d["uid"] or 0
+            color = get_user_color(interaction.guild, uid) if uid else None
+            plt.bar(xs, shares, width=width, label=f"{d['label']} (avg {avg:.2f})", color=color)
+            handles.append(Patch(color=color if color else 'tab:blue'))
+            labels.append(f"{d['label']} (avg {avg:.2f})")
+
+        plt.xticks(centers, [1,2,3,4,5,6,"X"])
+        plt.xlabel("Guesses (X = fail)")
+        plt.ylabel("Share")
+        plt.title(f"Guess histogram (normalized) ({n_users} users)")
+
+        ncols = max(2, min(n_users, 6))
+        plt.legend(handles=handles, labels=labels, loc="upper center", bbox_to_anchor=(0.5, -0.14), ncol=ncols, frameon=False)
+        plt.tight_layout()
+
+        buf = io.BytesIO()
+        plt.savefig(buf, format="png", dpi=180, bbox_inches="tight")
+        buf.seek(0)
+        await interaction.followup.send(file=discord.File(buf, "hist_normalized.png"))
+        plt.close()
+    except Exception:
+        traceback.print_exc()
+        await interaction.followup.send("Error generating normalized histogram.")
+
+# ---- Public: /retcon (adjust X total; deltas are ≤ 0 overall)
+@tree.command(description="Adjust a player's X total (use to remove unfair X or undo a removal)")
+@app_commands.describe(user="Target user", action="remove or add", count="How many (default 1)")
+async def retcon(interaction: discord.Interaction, user: discord.Member, action: str, count: Optional[int] = 1):
+    # Auth: owner can retcon anyone; users can retcon themselves
+    if user.id != interaction.user.id and (OWNER_ID and interaction.user.id != OWNER_ID):
+        await interaction.response.send_message("Not authorized to modify others.", ephemeral=True)
+        return
+
+    action = (action or "").strip().lower()
+    if action not in ("remove", "add"):
+        await interaction.response.send_message("Action must be 'remove' or 'add'.", ephemeral=True)
+        return
+
+    c = int(count or 1)
+    if c <= 0:
+        await interaction.response.send_message("Count must be positive.", ephemeral=True)
+        return
+
+    # remove => delta -c ; add => delta +c but overall clamped ≤ 0
+    change = (-c) if action == "remove" else (+c)
+    new_delta = apply_retcon(user.id, change)
+    # Public confirmation
+    verb = "removed" if action == "remove" else "added"
+    await interaction.response.send_message(f"{user.mention}: {verb} {c} X (retcon). New incomplete-games delta: {new_delta}", ephemeral=False)
+
+# ---- Admin: manual rescan (ephemeral)
 @tree.command(description="Re-parse last N messages.")
 @app_commands.describe(limit="How many messages (default 500)")
 async def rescan(interaction: discord.Interaction, limit: Optional[int] = 500):
     if OWNER_ID and interaction.user.id != OWNER_ID:
-        await interaction.response.send_message("Not authorized.", ephemeral=True)
-        return
-    if not await safe_defer(interaction, ephemeral=True):
-        return
+        await interaction.response.send_message("Not authorized.", ephemeral=True); return
+    if not await safe_defer(interaction, ephemeral=True): return
     try:
         channel = interaction.channel
         if not isinstance(channel, (discord.TextChannel, discord.Thread)):
-            await interaction.followup.send("Run in a text channel.", ephemeral=True)
-            return
-
+            await interaction.followup.send("Run in a text channel.", ephemeral=True); return
         parsed = await do_rescan_channel(channel, (limit or 500))
         await interaction.followup.send(f"Rescan complete. Parsed {parsed}.", ephemeral=True)
         kv_set("last_backfill_ymd", dt.datetime.now(dt.timezone.utc).date().isoformat())
