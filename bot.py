@@ -21,7 +21,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.patches import Patch
 
-# Avatar color support
+# Avatar/HTTP support (fallback color from avatar)
 import requests
 from PIL import Image
 from io import BytesIO
@@ -41,7 +41,7 @@ ALIASES_FILE = os.getenv("ALIASES_FILE") or "aliases.json"       # file-based al
 
 INTENTS = discord.Intents.default()
 INTENTS.message_content = True
-INTENTS.members = True  # needed for robust name matching + avatars
+INTENTS.members = True  # needed for robust name matching + avatars/roles
 
 
 # ========= DB =========
@@ -234,7 +234,6 @@ def load_aliases_file(guild: Optional[discord.Guild] = None) -> int:
             count += 1
         return count
     except Exception:
-        # swallow JSON/IO errors so the bot still boots
         traceback.print_exc()
         return 0
 
@@ -546,7 +545,7 @@ async def ensure_daily_backfill(interaction: discord.Interaction) -> None:
         traceback.print_exc()
 
 
-# ========= Avatar colors (cached) =========
+# ========= Role/Avatar colors (cached) =========
 _AVATAR_COLOR_CACHE: Dict[int, Tuple[float,float,float]] = {}
 
 def _dominant_color_from_bytes(b: bytes) -> Tuple[float,float,float]:
@@ -558,15 +557,35 @@ def _dominant_color_from_bytes(b: bytes) -> Tuple[float,float,float]:
     b_ = sum(p[2] for p in pixels) / len(pixels)
     return (r/255.0, g/255.0, b_/255.0)
 
+def _pastel_fallback(uid: int) -> Tuple[float,float,float]:
+    h = (uid % 360) / 360.0
+    r = 0.5 + 0.4*math.sin(2*math.pi*h)
+    g = 0.5 + 0.4*math.sin(2*math.pi*(h+1/3))
+    b = 0.5 + 0.4*math.sin(2*math.pi*(h+2/3))
+    return (max(0,min(1,r)), max(0,min(1,g)), max(0,min(1,b)))
+
 def get_user_color(guild: Optional[discord.Guild], user_id: int) -> Tuple[float,float,float]:
+    """Prefer member's top colored role; fallback to avatar color, then deterministic pastel."""
     if user_id in _AVATAR_COLOR_CACHE:
         return _AVATAR_COLOR_CACHE[user_id]
-    def fallback(uid: int) -> Tuple[float,float,float]:
-        h = (uid % 360) / 360.0
-        r = 0.5 + 0.4*math.sin(2*math.pi*h)
-        g = 0.5 + 0.4*math.sin(2*math.pi*(h+1/3))
-        b = 0.5 + 0.4*math.sin(2*math.pi*(h+2/3))
-        return (max(0,min(1,r)), max(0,min(1,g)), max(0,min(1,b)))
+
+    # 1) Role color (primary/top colored role)
+    try:
+        if guild:
+            m = guild.get_member(user_id)
+            if m:
+                for role in reversed(m.roles):  # highest first
+                    if role.is_default():
+                        continue
+                    if role.color.value != 0:
+                        r, g, b = role.color.to_rgb()
+                        col = (r/255.0, g/255.0, b/255.0)
+                        _AVATAR_COLOR_CACHE[user_id] = col
+                        return col
+    except Exception:
+        pass
+
+    # 2) Avatar dominant color
     try:
         if guild:
             m = guild.get_member(user_id)
@@ -579,7 +598,8 @@ def get_user_color(guild: Optional[discord.Guild], user_id: int) -> Tuple[float,
                     return col
     except Exception:
         pass
-    col = fallback(user_id)
+
+    col = _pastel_fallback(user_id)
     _AVATAR_COLOR_CACHE[user_id] = col
     return col
 
@@ -780,6 +800,25 @@ async def alias_reload(interaction: discord.Interaction):
         traceback.print_exc()
         await interaction.followup.send(f"Alias reload error: {e!r}", ephemeral=True)
 
+@tree.command(description="Admin: export current aliases to a downloadable JSON")
+async def alias_export(interaction: discord.Interaction):
+    if OWNER_ID and interaction.user.id != OWNER_ID:
+        await interaction.response.send_message("Not authorized.", ephemeral=True); return
+    try:
+        with sqlite3.connect(DB_PATH) as con:
+            items = list(con.execute("SELECT name_norm, user_id FROM aliases ORDER BY name_norm;"))
+        data = {"aliases": [{"name": n, "user_id": int(uid)} for (n, uid) in items]}
+        payload = json.dumps(data, indent=2)
+        buf = io.BytesIO(payload.encode("utf-8"))
+        await interaction.response.send_message(
+            "Exported aliases.json",
+            file=discord.File(buf, filename="aliases.json"),
+            ephemeral=True,
+        )
+    except Exception as e:
+        traceback.print_exc()
+        await interaction.response.send_message(f"Export failed: {e!r}", ephemeral=True)
+
 # ---- Public: Leaderboard (entire history; min 20 games)
 @tree.command(description="Leaderboard")
 async def leaderboard(interaction: discord.Interaction):
@@ -814,7 +853,7 @@ async def leaderboard(interaction: discord.Interaction):
             avg = total_points / games if games > 0 else 7.0
             out.append((avg, g["label"], len(g["solved_scores"]), effective_misses, games))
 
-        out.sort(key=lambda t: (t[2] == 0, t[0], -t[2]))  # prefer anyone with games, then avg asc, solves desc
+        out.sort(key=lambda t: (t[0], -t[2]))  # avg asc, solves desc
         if not out:
             await interaction.followup.send("No one meets the minimum games (20)."); return
 
@@ -894,7 +933,7 @@ async def stats(interaction: discord.Interaction, user: Optional[str] = None):
                 med = (flat_sorted[n//2 - 1] + flat_sorted[n//2]) / 2.0
 
         buckets = " • ".join([f"{lbl}: {counts[i]}" for i, lbl in enumerate([None,"1","2","3","4","5","6","X"]) if i])
-        inc_line = f"Incomplete games (retcon): {abs(delta)}" if delta < 0 else "Incomplete games (retcon): 0"
+        inc_line = f"Incomplete games: {abs(delta)}" if delta < 0 else "Incomplete games: 0"
         text = (
             f"**Stats — {target_label}**\n"
             f"Games: {games}  •  Wins: {wins}  •  Fails: {fails}\n"
@@ -975,7 +1014,7 @@ async def plot_histogram(interaction: discord.Interaction, top_n: Optional[int] 
 
         # Wider canvas scaling with user count
         fig_w = min(28, 10 + n_users * 1.2)
-        fig_h = 9.5  # a tad taller for labels + legend
+        fig_h = 9.5  # extra for labels + legend
         fig, ax = plt.subplots(figsize=(fig_w, fig_h))
 
         handles, labels = [], []
@@ -995,8 +1034,7 @@ async def plot_histogram(interaction: discord.Interaction, top_n: Optional[int] 
         ax.set_xlabel("Guesses (X = fail)")
         ax.set_ylabel("Count")
         ax.set_title(f"Guess histogram ({n_users} users)")
-        # Headroom for labels
-        ax.set_ylim(top=max_y * 1.15 + 0.5)
+        ax.set_ylim(top=max_y * 1.15 + 0.5)  # headroom
 
         ncols = max(2, min(n_users, 6))
         ax.legend(handles=handles, labels=labels, loc="upper center", bbox_to_anchor=(0.5, -0.14), ncol=ncols, frameon=False)
@@ -1070,7 +1108,7 @@ async def plot_normalized(interaction: discord.Interaction, top_n: Optional[int]
             uid = d["uid"] or 0
             color = get_user_color(interaction.guild, uid) if uid else None
             bars = ax.bar(xs, percents, width=width, label=f"{d['label']} (avg {avg:.2f})", color=color)
-            _annotate_bars(ax, bars, percents, fmt=lambda v: f"{v:.0f}%", min_show=0.5)  # hide super tiny labels
+            _annotate_bars(ax, bars, percents, fmt=lambda v: f"{v:.0f}%", min_show=0.5)  # hide tiny labels
             max_y = max(max_y, max(percents) if percents else 0.0)
             handles.append(Patch(color=color if color else 'tab:blue'))
             labels.append(f"{d['label']} (avg {avg:.2f})")
@@ -1079,7 +1117,6 @@ async def plot_normalized(interaction: discord.Interaction, top_n: Optional[int]
         ax.set_xlabel("Guesses (X = fail)")
         ax.set_ylabel("Percent")
         ax.set_title(f"Guess histogram (normalized) ({n_users} users)")
-        # Headroom for labels
         ax.set_ylim(0, max(100.0, max_y * 1.15 + 2.0))
 
         ncols = max(2, min(n_users, 6))
@@ -1120,7 +1157,7 @@ async def retcon(interaction: discord.Interaction, user: discord.Member, action:
     # Public confirmation
     verb = "removed" if action == "remove" else "added"
     await interaction.response.send_message(
-        f"{user.mention}: {verb} {c} X (retcon). New incomplete-games delta: {new_delta}",
+        f"{user.mention}: {verb} {c} X. New incomplete-games delta: {new_delta}",
         ephemeral=False,
     )
 
