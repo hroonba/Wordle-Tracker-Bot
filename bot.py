@@ -1182,29 +1182,36 @@ async def rescan(interaction: discord.Interaction, limit: Optional[int] = 500):
 
 # ========= Entrypoint =========
 import asyncio
-import time
-
-async def _run_with_backoff():
-    backoff = 60  # start with 1 minute
-    while True:
-        try:
-            await bot.start(TOKEN)
-            break  # clean shutdown
-        except discord.HTTPException as e:
-            # Cloudflare/Discord rate limit while logging in
-            if getattr(e, "status", None) == 429:
-                print(f"[login] 429 rate limited; sleeping {backoff}s before retry")
-                await asyncio.sleep(backoff)
-                backoff = min(backoff * 2, 1800)  # cap at 30 min
-                continue
-            raise
-        except Exception as e:
-            # Any other transient startup error; brief wait then retry
-            print(f"[login] unexpected error: {e!r}; retrying in 30s")
-            await asyncio.sleep(30)
+import logging
 
 if __name__ == "__main__":
     if not TOKEN:
         raise SystemExit("Missing DISCORD_BOT_TOKEN in environment.")
-    asyncio.run(_run_with_backoff())
 
+    # Helpful logging (INFO is fine; use DEBUG for deeper traces)
+    try:
+        discord.utils.setup_logging(level=logging.INFO)
+    except Exception:
+        logging.basicConfig(level=logging.INFO)
+
+    async def run_with_backoff():
+        backoff = 60  # start at 1 min
+        while True:
+            try:
+                # bot.run() handles close, but start inside a context guarantees the aiohttp session is closed on any exit
+                async with bot:
+                    await bot.start(TOKEN)
+                break  # normal shutdown
+            except discord.HTTPException as e:
+                # Login-time rate limit (you may see Cloudflare 1015)
+                if getattr(e, "status", None) == 429:
+                    logging.warning(f"[login] 429 rate limited; retrying in {backoff}s")
+                    await asyncio.sleep(backoff)
+                    backoff = min(backoff * 2, 1800)  # cap at 30 min
+                    continue
+                raise
+            except Exception as e:
+                logging.exception(f"[login] Unexpected error; retrying in 30s: {e!r}")
+                await asyncio.sleep(30)
+
+    asyncio.run(run_with_backoff())
