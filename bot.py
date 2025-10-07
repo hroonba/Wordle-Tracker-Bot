@@ -39,7 +39,7 @@ MAX_BACKFILL = int(os.getenv("MAX_BACKFILL") or "1500")
 
 ALIASES_FILE = os.getenv("ALIASES_FILE") or "aliases.json"
 
-# Leaderboard avg threshold (rule remains, we just don't print the line)
+# Leaderboard avg threshold (rule remains; just not printed)
 LEADERBOARD_MIN_GAMES = int(os.getenv("LEADERBOARD_MIN_GAMES") or "20")
 
 INTENTS = discord.Intents.default()
@@ -798,7 +798,7 @@ def compute_crowns(rows: List[Tuple]) -> Dict[tuple, int]:
     return crowns
 
 
-# ---- Public: Leaderboard (two sections)
+# ---- Public: Leaderboard (two sections) with updated formatting
 @tree.command(description="Leaderboard")
 async def leaderboard(interaction: discord.Interaction):
     await ensure_daily_backfill(interaction)
@@ -808,7 +808,7 @@ async def leaderboard(interaction: discord.Interaction):
         if not rows:
             await interaction.followup.send("No data yet."); return
 
-        # --- Average leaderboard
+        # --- Aggregate for averages + games/solves/fails
         agg: Dict[tuple, Dict] = {}
         for uid, uname, _day, score, solved, _ts in rows:
             key = identity_key(uid or 0, uname or "")
@@ -819,20 +819,28 @@ async def leaderboard(interaction: discord.Interaction):
             else:
                 g["misses"] += 1
 
+        # Average leaderboard with threshold
         avg_rank = []
+        # Also build a precomputed games dict for crowns section
+        games_by_key: Dict[tuple, Tuple[int,int,int]] = {}  # key -> (games, solves, fails)
         for key, g in agg.items():
             uid_guess = key[0] if key[0] else alias_lookup(g["uname"])
             delta = get_retcon_delta(uid_guess) if uid_guess else 0
             effective_misses = max(0, g["misses"] + delta)
             games = len(g["solved_scores"]) + effective_misses
+            solves = len(g["solved_scores"])
+            fails = effective_misses
+            games_by_key[key] = (games, solves, fails)
+
             if games < LEADERBOARD_MIN_GAMES:
                 continue
             total_points = sum(g["solved_scores"]) + 7 * effective_misses
             avg = total_points / games if games > 0 else 7.0
-            avg_rank.append((avg, g["label"], len(g["solved_scores"]), effective_misses, games))
-        avg_rank.sort(key=lambda t: (t[0], -t[2]))
+            avg_rank.append((avg, g["label"], games, solves, fails))
 
-        # --- Crowns leaderboard
+        avg_rank.sort(key=lambda t: (t[0], -t[3]))  # by avg asc, then solves desc
+
+        # Crowns leaderboard (no min-games filter), but we need games for % and formatting
         crowns = compute_crowns(rows)
         crowns_rank = []
         for key, count in crowns.items():
@@ -840,22 +848,26 @@ async def leaderboard(interaction: discord.Interaction):
             if not label:
                 uid, uname = key[0], key[1]
                 label = identity_label(uid, uname)
-            crowns_rank.append((count, label))
+            games, solves, fails = games_by_key.get(key, (0,0,0))
+            pct = (count / games * 100.0) if games > 0 else 0.0
+            crowns_rank.append((count, label, games, pct))
+
         crowns_rank.sort(key=lambda t: (-t[0], t[1].lower()))
 
         if not avg_rank and not crowns_rank:
             await interaction.followup.send("No leaderboard data to show yet."); return
 
+        # Build output with the new formatting
         lines: List[str] = []
         if avg_rank:
             lines.append("**Leaderboard (Average Guesses)**")
-            for i, (avg, label, solves, misses, games) in enumerate(avg_rank, 1):
-                lines.append(f"#{i} {label}: avg {avg:.2f} (solves {solves}, X {misses}, games {games})")
+            for i, (avg, label, games, solves, fails) in enumerate(avg_rank, 1):
+                lines.append(f"#{i} {label} — {avg:.2f} avg ({games} games, {solves} solves, {fails} fails)")
         if crowns_rank:
             if lines: lines.append("— — —")
             lines.append("**Leaderboard (Daily Crowns)**")
-            for i, (count, label) in enumerate(crowns_rank, 1):
-                lines.append(f"#{i} {label}: [{count}] Crowns")
+            for i, (count, label, games, pct) in enumerate(crowns_rank, 1):
+                lines.append(f"#{i} {label} — {count} Crowns 👑 ({games} games, {pct:.1f}% win rate)")
 
         await interaction.followup.send("\n".join(lines))
     except Exception:
@@ -1131,7 +1143,7 @@ async def retcon(interaction: discord.Interaction, user: discord.Member, action:
         ephemeral=False,
     )
 
-# NEW: list all retcon deltas (private)
+# Admin-only private helpers for retcons
 @tree.command(description="Admin: list all retcon X deltas (private)")
 async def retcon_list(interaction: discord.Interaction):
     if OWNER_ID and interaction.user.id != OWNER_ID:
@@ -1156,7 +1168,6 @@ async def retcon_list(interaction: discord.Interaction):
         traceback.print_exc()
         await interaction.followup.send("Error listing retcons.", ephemeral=True)
 
-# NEW: export retcons as JSON (private)
 @tree.command(description="Admin: export retcon X deltas as JSON (private)")
 async def retcon_export(interaction: discord.Interaction):
     if OWNER_ID and interaction.user.id != OWNER_ID:
