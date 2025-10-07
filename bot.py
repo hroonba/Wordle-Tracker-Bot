@@ -38,13 +38,27 @@ DB_PATH = os.getenv("DB_PATH") or "wordle_scores.db"
 MAX_BACKFILL = int(os.getenv("MAX_BACKFILL") or "1500")
 
 ALIASES_FILE = os.getenv("ALIASES_FILE") or "aliases.json"
+RETCONS_FILE = os.getenv("RETCONS_FILE") or "retcons.json"  # <— NEW
 
-# Leaderboard avg threshold (rule remains; just not printed)
+# Leaderboard avg threshold
 LEADERBOARD_MIN_GAMES = int(os.getenv("LEADERBOARD_MIN_GAMES") or "20")
 
 INTENTS = discord.Intents.default()
 INTENTS.message_content = True
 INTENTS.members = True
+
+
+# ========= FS helpers =========
+def _ensure_parent_dir(path: str):
+    try:
+        d = os.path.dirname(path)
+        if d:
+            os.makedirs(d, exist_ok=True)
+    except Exception:
+        pass
+
+# Ensure DB directory exists if DB_PATH points into a mounted disk like /data
+_ensure_parent_dir(DB_PATH)
 
 
 # ========= DB =========
@@ -136,9 +150,14 @@ def apply_retcon(user_id: int, change: int) -> int:
             "ON CONFLICT(user_id) DO UPDATE SET delta_x=excluded.delta_x;",
             (user_id, new_val),
         )
-        return new_val
+    # persist JSON mirror
+    try:
+        save_retcons_file()
+    except Exception:
+        traceback.print_exc()
+    return new_val
 
-def fetch_all_scores() -> List[Tuple]:
+def fetch_all_scores() -> List[Tuple]]:
     with sqlite3.connect(DB_PATH) as con:
         cur = con.execute("""
             SELECT user_id, username, day, score, solved, ts
@@ -227,6 +246,63 @@ def load_aliases_file(guild: Optional[discord.Guild] = None) -> int:
     except Exception:
         traceback.print_exc()
         return 0
+
+
+# ========= Retcons JSON <— NEW =========
+def load_retcons_file() -> int:
+    """
+    Load retcons from RETCONS_FILE (if present) and upsert into DB.
+    Returns number of entries imported/updated.
+    """
+    path = RETCONS_FILE
+    if not path or not os.path.exists(path):
+        return 0
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            raw = f.read().strip()
+            if not raw:
+                return 0
+            data = json.loads(raw)
+        items = data.get("retcons", [])
+        count = 0
+        with sqlite3.connect(DB_PATH) as con:
+            con.execute("CREATE TABLE IF NOT EXISTS retcons (user_id INTEGER PRIMARY KEY, delta_x INTEGER NOT NULL);")
+            for it in items:
+                uid = int(it.get("user_id", 0))
+                dx = int(it.get("delta_x", 0))
+                if uid == 0:
+                    continue
+                if dx > 0:
+                    dx = 0
+                con.execute(
+                    "INSERT INTO retcons(user_id, delta_x) VALUES(?, ?) "
+                    "ON CONFLICT(user_id) DO UPDATE SET delta_x=excluded.delta_x;",
+                    (uid, dx),
+                )
+                count += 1
+        return count
+    except Exception:
+        traceback.print_exc()
+        return 0
+
+def save_retcons_file() -> None:
+    """
+    Dump current DB retcons to RETCONS_FILE (best-effort).
+    """
+    path = RETCONS_FILE
+    if not path:
+        return
+    try:
+        _ensure_parent_dir(path)
+        with sqlite3.connect(DB_PATH) as con:
+            rows = list(con.execute("SELECT user_id, delta_x FROM retcons ORDER BY user_id;"))
+        data = {"retcons": [{"user_id": int(uid), "delta_x": int(dx)} for (uid, dx) in rows]}
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+        os.replace(tmp, path)
+    except Exception:
+        traceback.print_exc()
 
 
 # ========= Identity helpers =========
@@ -585,7 +661,11 @@ async def on_ready():
         for g in bot.guilds:
             await build_member_index(g)
             load_aliases_file(g)
-            print(f"Indexed {len(MEMBER_INDEX.get(g.id, {}))} members for guild {g.id}")
+        # Load retcons.json once at startup (guild-agnostic)
+        imported = load_retcons_file()
+        if imported:
+            print(f"Loaded retcons.json: {imported} entries")
+        print("Member indexes and alias/retcon files loaded.")
     except Exception:
         traceback.print_exc()
 
@@ -775,7 +855,7 @@ async def alias_export(interaction: discord.Interaction):
         await interaction.response.send_message(f"Export failed: {e!r}", ephemeral=True)
 
 
-# ---- Helpers for crowns (computed from scores on the fly)
+# ---- Helpers for crowns
 def compute_crowns(rows: List[Tuple]) -> Dict[tuple, int]:
     """
     Return { identity_key: crown_count }.
@@ -798,7 +878,7 @@ def compute_crowns(rows: List[Tuple]) -> Dict[tuple, int]:
     return crowns
 
 
-# ---- Public: Leaderboard (two sections) with updated formatting
+# ---- Public: Leaderboard
 @tree.command(description="Leaderboard")
 async def leaderboard(interaction: discord.Interaction):
     await ensure_daily_backfill(interaction)
@@ -808,7 +888,7 @@ async def leaderboard(interaction: discord.Interaction):
         if not rows:
             await interaction.followup.send("No data yet."); return
 
-        # --- Aggregate for averages + games/solves/fails
+        # Aggregate for averages + games/solves/fails
         agg: Dict[tuple, Dict] = {}
         for uid, uname, _day, score, solved, _ts in rows:
             key = identity_key(uid or 0, uname or "")
@@ -821,7 +901,6 @@ async def leaderboard(interaction: discord.Interaction):
 
         # Average leaderboard with threshold
         avg_rank = []
-        # Also build a precomputed games dict for crowns section
         games_by_key: Dict[tuple, Tuple[int,int,int]] = {}  # key -> (games, solves, fails)
         for key, g in agg.items():
             uid_guess = key[0] if key[0] else alias_lookup(g["uname"])
@@ -840,7 +919,7 @@ async def leaderboard(interaction: discord.Interaction):
 
         avg_rank.sort(key=lambda t: (t[0], -t[3]))  # by avg asc, then solves desc
 
-        # Crowns leaderboard (no min-games filter), but we need games for % and formatting
+        # Crowns leaderboard (no min-games filter)
         crowns = compute_crowns(rows)
         crowns_rank = []
         for key, count in crowns.items():
@@ -851,13 +930,11 @@ async def leaderboard(interaction: discord.Interaction):
             games, solves, fails = games_by_key.get(key, (0,0,0))
             pct = (count / games * 100.0) if games > 0 else 0.0
             crowns_rank.append((count, label, games, pct))
-
         crowns_rank.sort(key=lambda t: (-t[0], t[1].lower()))
 
         if not avg_rank and not crowns_rank:
             await interaction.followup.send("No leaderboard data to show yet."); return
 
-        # Build output with the new formatting
         lines: List[str] = []
         if avg_rank:
             lines.append("**Leaderboard (Average Guesses)**")
@@ -1174,11 +1251,10 @@ async def retcon_export(interaction: discord.Interaction):
         await interaction.response.send_message("Not authorized.", ephemeral=True)
         return
     try:
-        with sqlite3.connect(DB_PATH) as con:
-            items = list(con.execute("SELECT user_id, delta_x FROM retcons ORDER BY user_id;"))
-        data = {"retcons": [{"user_id": int(uid), "delta_x": int(dx)} for (uid, dx) in items]}
-        payload = json.dumps(data, indent=2)
-        buf = io.BytesIO(payload.encode("utf-8"))
+        # ensure latest DB -> file
+        save_retcons_file()
+        with open(RETCONS_FILE, "rb") as f:
+            buf = io.BytesIO(f.read())
         await interaction.response.send_message(
             "Exported retcons.json",
             file=discord.File(buf, filename="retcons.json"),
