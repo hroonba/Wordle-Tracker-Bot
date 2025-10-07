@@ -157,7 +157,7 @@ def apply_retcon(user_id: int, change: int) -> int:
         traceback.print_exc()
     return new_val
 
-def fetch_all_scores() -> List[Tuple]]:
+def fetch_all_scores() -> List[Tuple]:
     with sqlite3.connect(DB_PATH) as con:
         cur = con.execute("""
             SELECT user_id, username, day, score, solved, ts
