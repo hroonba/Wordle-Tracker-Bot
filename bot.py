@@ -871,27 +871,58 @@ async def alias_export(interaction: discord.Interaction):
         traceback.print_exc()
         await interaction.response.send_message(f"Export failed: {e!r}", ephemeral=True)
 
+
 @tree.command(name="toggle_player", description="Include or exclude a player from leaderboards and plots")
-@app_commands.describe(player="Player to toggle inclusion")
-async def toggle_player(interaction: discord.Interaction, player: discord.Member):
-    data = load_players()
-    excluded = set(data.get("excluded_players", []))
-    uid = str(player.id)
+@app_commands.describe(
+    user="Mention a user currently in the server",
+    user_id="Paste a Discord user ID (for users who have left)"
+)
+async def toggle_player(
+    interaction: discord.Interaction,
+    user: discord.User | None = None,
+    user_id: str | None = None
+):
+    # Validation: exactly one must be provided
+    if (user is None and user_id is None) or (user is not None and user_id is not None):
+        await interaction.response.send_message(
+            "❌ You must provide **either** a user **or** a user ID (but not both).",
+            ephemeral=True
+        )
+        return
 
-    if uid in excluded:
-        excluded.remove(uid)
-        action = "included"
+    # Resolve target user ID
+    if user is not None:
+        target_id = str(user.id)
+        display_name = user.mention
     else:
-        excluded.add(uid)
-        action = "excluded"
+        if not user_id.isdigit():
+            await interaction.response.send_message(
+                "❌ `user_id` must be a numeric Discord ID.",
+                ephemeral=True
+            )
+            return
+        target_id = user_id
+        display_name = f"`{user_id}`"
 
-    data["excluded_players"] = sorted(excluded)
-    save_players(data)
+    players = load_players()
+
+    # Initialize player record if missing
+    if target_id not in players:
+        players[target_id] = {
+            "included": False
+        }
+
+    # Toggle inclusion
+    players[target_id]["included"] = not players[target_id].get("included", True)
+    save_players(players)
+
+    status = "✅ **INCLUDED**" if players[target_id]["included"] else "🚫 **EXCLUDED**"
 
     await interaction.response.send_message(
-        f"✅ {player.mention} has been **{action}** from leaderboards and plots.",
+        f"{status} — {display_name} has been updated.",
         ephemeral=True
     )
+
 
 @tree.command(name="player_list", description="Show included and excluded players")
 async def player_list(interaction: discord.Interaction):
