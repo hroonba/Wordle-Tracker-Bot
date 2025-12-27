@@ -57,6 +57,23 @@ def _ensure_parent_dir(path: str):
     except Exception:
         pass
 
+PLAYERS_FILE = "players.json"
+
+def load_players():
+    if not os.path.exists(PLAYERS_FILE):
+        return {"excluded_players": []}
+    with open(PLAYERS_FILE, "r") as f:
+        return json.load(f)
+
+def save_players(data):
+    with open(PLAYERS_FILE, "w") as f:
+        json.dump(data, f, indent=2)
+
+def is_player_excluded(user_id: int) -> bool:
+    data = load_players()
+    return str(user_id) in data.get("excluded_players", [])
+
+
 # Ensure DB directory exists if DB_PATH points into a mounted disk like /data
 _ensure_parent_dir(DB_PATH)
 
@@ -854,6 +871,52 @@ async def alias_export(interaction: discord.Interaction):
         traceback.print_exc()
         await interaction.response.send_message(f"Export failed: {e!r}", ephemeral=True)
 
+@tree.command(name="toggle_player", description="Include or exclude a player from leaderboards and plots")
+@app_commands.describe(player="Player to toggle inclusion")
+async def toggle_player(interaction: discord.Interaction, player: discord.Member):
+    data = load_players()
+    excluded = set(data.get("excluded_players", []))
+    uid = str(player.id)
+
+    if uid in excluded:
+        excluded.remove(uid)
+        action = "included"
+    else:
+        excluded.add(uid)
+        action = "excluded"
+
+    data["excluded_players"] = sorted(excluded)
+    save_players(data)
+
+    await interaction.response.send_message(
+        f"✅ {player.mention} has been **{action}** from leaderboards and plots.",
+        ephemeral=True
+    )
+
+@tree.command(name="player_list", description="Show included and excluded players")
+async def player_list(interaction: discord.Interaction):
+    data = load_players()
+    excluded_ids = set(data.get("excluded_players", []))
+
+    included = []
+    excluded = []
+
+    for member in interaction.guild.members:
+        if member.bot:
+            continue
+        if str(member.id) in excluded_ids:
+            excluded.append(member.mention)
+        else:
+            included.append(member.mention)
+
+    msg = "**Included Players:**\n"
+    msg += "\n".join(included) if included else "_None_"
+    msg += "\n\n**Excluded Players:**\n"
+    msg += "\n".join(excluded) if excluded else "_None_"
+
+    await interaction.response.send_message(msg, ephemeral=True)
+
+
 
 # ---- Helpers for crowns
 def compute_crowns(rows: List[Tuple]) -> Dict[tuple, int]:
@@ -863,6 +926,8 @@ def compute_crowns(rows: List[Tuple]) -> Dict[tuple, int]:
     """
     per_day: Dict[int, List[Tuple[tuple, int, Optional[int], str, int]]] = {}
     for uid, uname, day, score, solved, _ts in rows:
+        if is_player_excluded(uid):
+                continue
         key = identity_key(uid or 0, uname or "")
         per_day.setdefault(day, []).append((key, solved, score, uname, (uid or 0)))
 
@@ -891,11 +956,15 @@ async def leaderboard(interaction: discord.Interaction):
         # Aggregate for averages + games/solves/fails
         agg: Dict[tuple, Dict] = {}
         for uid, uname, _day, score, solved, _ts in rows:
+            if is_player_excluded(uid):
+                continue
             key = identity_key(uid or 0, uname or "")
             label = identity_label(uid or 0, uname or "Unknown")
             g = agg.setdefault(key, {"label": label, "solved_scores": [], "misses": 0, "uid": uid or 0, "uname": uname})
             if solved == 1:
                 g["solved_scores"].append(score)
+            if is_player_excluded(uid):
+                continue
             else:
                 g["misses"] += 1
 
@@ -927,6 +996,8 @@ async def leaderboard(interaction: discord.Interaction):
             if not label:
                 uid, uname = key[0], key[1]
                 label = identity_label(uid, uname)
+            if is_player_excluded(uid):
+                continue
             games, solves, fails = games_by_key.get(key, (0,0,0))
             pct = (count / games * 100.0) if games > 0 else 0.0
             crowns_rank.append((count, label, games, pct))
@@ -1056,6 +1127,8 @@ async def plot_histogram(interaction: discord.Interaction, top_n: Optional[int] 
 
         per_user: Dict[tuple, Dict] = {}
         for uid, uname, _day, score, solved, _ts in rows:
+            if is_player_excluded(uid):
+                continue
             key = identity_key(uid or 0, uname or "")
             label = label_plain_for_hist(interaction.guild, uid or 0, uname or "Unknown")
             entry = per_user.setdefault(key, {"label": label, "uid": (uid or alias_lookup(uname)), "counts": {i:0 for i in range(1,8)}})
@@ -1132,6 +1205,8 @@ async def plot_normalized(interaction: discord.Interaction, top_n: Optional[int]
 
         per_user: Dict[tuple, Dict] = {}
         for uid, uname, _day, score, solved, _ts in rows:
+            if is_player_excluded(uid):
+                continue
             key = identity_key(uid or 0, uname or "")
             label = label_plain_for_hist(interaction.guild, uid or 0, uname or "Unknown")
             entry = per_user.setdefault(key, {"label": label, "uid": (uid or alias_lookup(uname)), "counts": {i:0 for i in range(1,8)}})
