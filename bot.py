@@ -1401,20 +1401,7 @@ if __name__ == "__main__":
 
     async def run_with_backoff():
         backoff = 60
-        while True:
-            try:
-                async with bot:
-                    await bot.start(TOKEN)
-                break
-            except discord.HTTPException as e:
-                if getattr(e, "status", None) == 429:
-                    logging.warning(f"[login] 429 rate limited; retrying in {backoff}s")
-                    await asyncio.sleep(backoff)
-                    backoff = min(backoff * 2, 1800)
-                    continue
-                raise
-            except Exception as e:
-                logging.exception(f"[login] Unexpected error; retrying in 30s: {e!r}")
-                await asyncio.sleep(30)
+        run_with_backoff(TOKEN)
+
 
     asyncio.run(run_with_backoff())
