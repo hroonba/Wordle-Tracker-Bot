@@ -41,7 +41,7 @@ ALIASES_FILE = os.getenv("ALIASES_FILE") or "aliases.json"
 RETCONS_FILE = os.getenv("RETCONS_FILE") or "retcons.json"  # <— NEW
 
 # Leaderboard avg threshold
-LEADERBOARD_MIN_GAMES = int(os.getenv("LEADERBOARD_MIN_GAMES") or "20")
+LEADERBOARD_MIN_GAMES = int(os.getenv("LEADERBOARD_MIN_GAMES") or "25")
 
 INTENTS = discord.Intents.default()
 INTENTS.message_content = True
