@@ -1041,12 +1041,12 @@ async def leaderboard(interaction: discord.Interaction):
         if avg_rank:
             lines.append("**Leaderboard (Average Guesses)**")
             for i, (avg, label, games, solves, fails) in enumerate(avg_rank, 1):
-                lines.append(f"#{i} {label} — {avg:.2f} avg ({games} games, {fails} fails)")
+                lines.append(f"#{i} {label} — {avg:.2f} avg ({games} games, {solves} solves, {fails} fails)")
         if crowns_rank:
             if lines: lines.append("— — —")
-            lines.append("**Leaderboard (Daily Crowns 👑)**")
+            lines.append("**Leaderboard (Daily Crowns)**")
             for i, (count, label, games, pct) in enumerate(crowns_rank, 1):
-                lines.append(f"#{i} {label} — {count} 👑 ({games} games, {pct:.1f}% win rate)")
+                lines.append(f"#{i} {label} — {count} Crowns 👑 ({games} games, {pct:.1f}% win rate)")
 
         await interaction.followup.send("\n".join(lines))
     except Exception:
