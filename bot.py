@@ -57,21 +57,49 @@ def _ensure_parent_dir(path: str):
     except Exception:
         pass
 
-PLAYERS_FILE = "players.json"
 
-def load_players():
+# --- Player include/exclude file (consistent structure) ---
+PLAYERS_FILE = os.getenv("PLAYERS_FILE") or "players.json"
+
+def load_players() -> dict:
+    """
+    File format:
+    {
+      "excluded_players": ["123...", "456..."]
+    }
+    """
     if not os.path.exists(PLAYERS_FILE):
         return {"excluded_players": []}
-    with open(PLAYERS_FILE, "r") as f:
-        return json.load(f)
+    try:
+        with open(PLAYERS_FILE, "r", encoding="utf-8") as f:
+            raw = f.read().strip()
+            if not raw:
+                return {"excluded_players": []}
+            data = json.loads(raw)
+        if "excluded_players" not in data or not isinstance(data["excluded_players"], list):
+            return {"excluded_players": []}
+        # Normalize to strings
+        data["excluded_players"] = [str(x) for x in data["excluded_players"] if str(x).isdigit()]
+        return data
+    except Exception:
+        traceback.print_exc()
+        return {"excluded_players": []}
 
-def save_players(data):
-    with open(PLAYERS_FILE, "w") as f:
-        json.dump(data, f, indent=2)
+def save_players(data: dict) -> None:
+    try:
+        _ensure_parent_dir(PLAYERS_FILE)
+        tmp = PLAYERS_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+        os.replace(tmp, PLAYERS_FILE)
+    except Exception:
+        traceback.print_exc()
 
 def is_player_excluded(user_id: int) -> bool:
+    if not user_id:
+        return False
     data = load_players()
-    return str(user_id) in data.get("excluded_players", [])
+    return str(user_id) in set(data.get("excluded_players", []))
 
 
 # Ensure DB directory exists if DB_PATH points into a mounted disk like /data
@@ -126,7 +154,10 @@ def kv_get(key: str) -> Optional[str]:
 
 def kv_set(key: str, value: str):
     with sqlite3.connect(DB_PATH) as con:
-        con.execute("INSERT INTO kv (k, v) VALUES (?, ?) ON CONFLICT(k) DO UPDATE SET v=excluded.v;", (key, value))
+        con.execute(
+            "INSERT INTO kv (k, v) VALUES (?, ?) ON CONFLICT(k) DO UPDATE SET v=excluded.v;",
+            (key, value),
+        )
 
 def upsert_score(user_id: int, username: str, day: int, score: Optional[int], solved: bool):
     with sqlite3.connect(DB_PATH) as con:
@@ -176,11 +207,13 @@ def apply_retcon(user_id: int, change: int) -> int:
 
 def fetch_all_scores() -> List[Tuple]:
     with sqlite3.connect(DB_PATH) as con:
-        cur = con.execute("""
+        cur = con.execute(
+            """
             SELECT user_id, username, day, score, solved, ts
               FROM scores
              ORDER BY user_id, ts ASC;
-        """)
+            """
+        )
         return list(cur.fetchall())
 
 
@@ -202,11 +235,14 @@ def alias_lookup(name: str) -> int:
 def alias_set(name: str, user_id: int):
     n = normalize_username(name)
     with sqlite3.connect(DB_PATH) as con:
-        con.execute("""
+        con.execute(
+            """
             INSERT INTO aliases (name_norm, user_id)
             VALUES (?, ?)
             ON CONFLICT(name_norm) DO UPDATE SET user_id=excluded.user_id;
-        """, (n, user_id))
+            """,
+            (n, user_id),
+        )
 
 def alias_delete(name: str):
     n = normalize_username(name)
@@ -224,7 +260,8 @@ def apply_alias_to_history(name: str, user_id: int, display_name: str):
         for rowid, _u, un, day, score, solved, ts in rows:
             if normalize_username(un) == n:
                 con.execute("DELETE FROM scores WHERE rowid = ?;", (rowid,))
-                con.execute("""
+                con.execute(
+                    """
                     INSERT INTO scores (user_id, username, day, score, solved, ts)
                     VALUES (?, ?, ?, ?, ?, ?)
                     ON CONFLICT(user_id, day) DO UPDATE SET
@@ -232,7 +269,9 @@ def apply_alias_to_history(name: str, user_id: int, display_name: str):
                       score=COALESCE(excluded.score, score),
                       solved=excluded.solved,
                       ts=MAX(ts, excluded.ts);
-                """, (user_id, display_name, day, score, solved, ts))
+                    """,
+                    (user_id, display_name, day, score, solved, ts),
+                )
         con.commit()
 
 def load_aliases_file(guild: Optional[discord.Guild] = None) -> int:
@@ -265,12 +304,8 @@ def load_aliases_file(guild: Optional[discord.Guild] = None) -> int:
         return 0
 
 
-# ========= Retcons JSON <— NEW =========
+# ========= Retcons JSON =========
 def load_retcons_file() -> int:
-    """
-    Load retcons from RETCONS_FILE (if present) and upsert into DB.
-    Returns number of entries imported/updated.
-    """
     path = RETCONS_FILE
     if not path or not os.path.exists(path):
         return 0
@@ -303,9 +338,6 @@ def load_retcons_file() -> int:
         return 0
 
 def save_retcons_file() -> None:
-    """
-    Dump current DB retcons to RETCONS_FILE (best-effort).
-    """
     path = RETCONS_FILE
     if not path:
         return
@@ -633,7 +665,8 @@ def get_user_color(guild: Optional[discord.Guild], user_id: int) -> Tuple[float,
             m = guild.get_member(user_id)
             if m:
                 for role in reversed(m.roles):
-                    if role.is_default(): continue
+                    if role.is_default():
+                        continue
                     if role.color.value != 0:
                         r, g, b = role.color.to_rgb()
                         col = (r/255.0, g/255.0, b/255.0)
@@ -678,7 +711,6 @@ async def on_ready():
         for g in bot.guilds:
             await build_member_index(g)
             load_aliases_file(g)
-        # Load retcons.json once at startup (guild-agnostic)
         imported = load_retcons_file()
         if imported:
             print(f"Loaded retcons.json: {imported} entries")
@@ -759,7 +791,7 @@ async def sync(interaction: discord.Interaction, scope: Optional[str] = "guild")
         await interaction.response.send_message("Not authorized.", ephemeral=True)
         return
     scope = (scope or "guild").lower()
-    if not await safe_defer(interaction, ephemeral=True): 
+    if not await safe_defer(interaction, ephemeral=True):
         return
     try:
         if scope == "guild":
@@ -782,7 +814,8 @@ async def sync(interaction: discord.Interaction, scope: Optional[str] = "guild")
             out = await tree.sync(guild=guild_obj)
             await interaction.followup.send(f"Purged and re-synced guild commands ({len(out)}).", ephemeral=True)
         elif scope == "purge_global":
-            tree.clear_commands(guild=None)
+            # Correct usage: clear global commands by not providing a guild at all.
+            tree.clear_commands()
             await tree.sync()
             await interaction.followup.send("Purged all GLOBAL commands from Discord.", ephemeral=True)
         else:
@@ -872,6 +905,7 @@ async def alias_export(interaction: discord.Interaction):
         await interaction.response.send_message(f"Export failed: {e!r}", ephemeral=True)
 
 
+# --- Player toggle: user OR user_id; toggles excluded_players list ---
 @tree.command(name="toggle_player", description="Include or exclude a player from leaderboards and plots")
 @app_commands.describe(
     user="Mention a user currently in the server",
@@ -882,44 +916,37 @@ async def toggle_player(
     user: discord.User | None = None,
     user_id: str | None = None
 ):
-    # Validation: exactly one must be provided
     if (user is None and user_id is None) or (user is not None and user_id is not None):
         await interaction.response.send_message(
-            "❌ You must provide **either** a user **or** a user ID (but not both).",
+            "❌ Provide **either** `user` **or** `user_id` (but not both).",
             ephemeral=True
         )
         return
 
-    # Resolve target user ID
     if user is not None:
         target_id = str(user.id)
-        display_name = user.mention
+        display = user.mention
     else:
-        if not user_id.isdigit():
-            await interaction.response.send_message(
-                "❌ `user_id` must be a numeric Discord ID.",
-                ephemeral=True
-            )
+        if not user_id or not user_id.isdigit():
+            await interaction.response.send_message("❌ `user_id` must be a numeric Discord ID.", ephemeral=True)
             return
         target_id = user_id
-        display_name = f"`{user_id}`"
+        display = f"`{user_id}`"
 
-    players = load_players()
+    data = load_players()
+    excluded = set(data.get("excluded_players", []))
+    if target_id in excluded:
+        excluded.remove(target_id)
+        status = "✅ **INCLUDED**"
+    else:
+        excluded.add(target_id)
+        status = "🚫 **EXCLUDED**"
 
-    # Initialize player record if missing
-    if target_id not in players:
-        players[target_id] = {
-            "included": False
-        }
-
-    # Toggle inclusion
-    players[target_id]["included"] = not players[target_id].get("included", True)
-    save_players(players)
-
-    status = "✅ **INCLUDED**" if players[target_id]["included"] else "🚫 **EXCLUDED**"
+    data["excluded_players"] = sorted(excluded)
+    save_players(data)
 
     await interaction.response.send_message(
-        f"{status} — {display_name} has been updated.",
+        f"{status} — {display} updated.",
         ephemeral=True
     )
 
@@ -929,24 +956,36 @@ async def player_list(interaction: discord.Interaction):
     data = load_players()
     excluded_ids = set(data.get("excluded_players", []))
 
-    included = []
-    excluded = []
+    included_lines: list[str] = []
+    excluded_lines: list[str] = []
 
-    for member in interaction.guild.members:
+    guild = interaction.guild
+    if not guild:
+        await interaction.response.send_message("Run this command in a server.", ephemeral=True)
+        return
+
+    # Included: current members not excluded
+    for member in guild.members:
         if member.bot:
             continue
         if str(member.id) in excluded_ids:
-            excluded.append(member.mention)
+            continue
+        included_lines.append(member.mention)
+
+    # Excluded: show mentions if member exists, else show raw ID
+    for uid_str in sorted(excluded_ids):
+        m = guild.get_member(int(uid_str)) if uid_str.isdigit() else None
+        if m:
+            excluded_lines.append(m.mention)
         else:
-            included.append(member.mention)
+            excluded_lines.append(f"`{uid_str}` (not in server)")
 
     msg = "**Included Players:**\n"
-    msg += "\n".join(included) if included else "_None_"
+    msg += "\n".join(included_lines) if included_lines else "_None_"
     msg += "\n\n**Excluded Players:**\n"
-    msg += "\n".join(excluded) if excluded else "_None_"
+    msg += "\n".join(excluded_lines) if excluded_lines else "_None_"
 
     await interaction.response.send_message(msg, ephemeral=True)
-
 
 
 # ---- Helpers for crowns
@@ -957,8 +996,8 @@ def compute_crowns(rows: List[Tuple]) -> Dict[tuple, int]:
     """
     per_day: Dict[int, List[Tuple[tuple, int, Optional[int], str, int]]] = {}
     for uid, uname, day, score, solved, _ts in rows:
-        if is_player_excluded(uid):
-                continue
+        if uid and is_player_excluded(uid):
+            continue
         key = identity_key(uid or 0, uname or "")
         per_day.setdefault(day, []).append((key, solved, score, uname, (uid or 0)))
 
@@ -987,17 +1026,15 @@ async def leaderboard(interaction: discord.Interaction):
         # Aggregate for averages + games/solves/fails
         agg: Dict[tuple, Dict] = {}
         for uid, uname, _day, score, solved, _ts in rows:
-            if is_player_excluded(uid):
+            if uid and is_player_excluded(uid):
                 continue
             key = identity_key(uid or 0, uname or "")
             label = identity_label(uid or 0, uname or "Unknown")
             g = agg.setdefault(key, {"label": label, "solved_scores": [], "misses": 0, "uid": uid or 0, "uname": uname})
-            if solved == 1:
-                g["solved_scores"].append(score)
-            if is_player_excluded(uid):
-                continue
+            if solved == 1 and score is not None:
+                g["solved_scores"].append(int(score))
             else:
-                g["misses"] += 1
+                g["misses"] += 1  # only count fails here
 
         # Average leaderboard with threshold
         avg_rank = []
@@ -1027,7 +1064,8 @@ async def leaderboard(interaction: discord.Interaction):
             if not label:
                 uid, uname = key[0], key[1]
                 label = identity_label(uid, uname)
-            if is_player_excluded(uid):
+            uid = key[0] if isinstance(key, tuple) else 0
+            if uid and is_player_excluded(uid):
                 continue
             games, solves, fails = games_by_key.get(key, (0,0,0))
             pct = (count / games * 100.0) if games > 0 else 0.0
@@ -1044,14 +1082,15 @@ async def leaderboard(interaction: discord.Interaction):
                 lines.append(f"#{i} {label} — {avg:.2f} avg ({games} games, {solves} solves, {fails} fails)")
         if crowns_rank:
             if lines: lines.append("— — —")
-            lines.append("**Leaderboard (Daily Crowns)**")
+            lines.append("**Leaderboard (Daily Crowns 👑)**")
             for i, (count, label, games, pct) in enumerate(crowns_rank, 1):
-                lines.append(f"#{i} {label} — {count} Crowns 👑 ({games} games, {pct:.1f}% win rate)")
+                lines.append(f"#{i} {label} — {count} 👑 ({games} games, {pct:.0f}% win rate)")
 
         await interaction.followup.send("\n".join(lines))
     except Exception:
         traceback.print_exc()
         await interaction.followup.send("Error generating leaderboard.")
+
 
 # ---- Public: Stats (single user) — includes Crowns
 @tree.command(description="Stats for a single player")
@@ -1094,10 +1133,11 @@ async def stats(interaction: discord.Interaction, user: Optional[str] = None):
 
         counts = {i: 0 for i in range(1, 8)}
         for _uid, _uname, _day, score, solved, _ts in user_rows:
-            if solved == 1:
-                counts[score] += 1
+            if solved == 1 and score is not None:
+                counts[int(score)] += 1
             else:
                 counts[7] += 1
+
         delta = get_retcon_delta(target_id)
         if delta < 0:
             counts[7] = max(0, counts[7] + delta)
@@ -1107,7 +1147,8 @@ async def stats(interaction: discord.Interaction, user: Optional[str] = None):
         fails = counts[7]
 
         flat = []
-        for g, c in counts.items(): flat.extend([g]*c)
+        for g, c in counts.items():
+            flat.extend([g]*c)
         avg = (sum(flat)/len(flat)) if flat else 7.0
         med = 7
         if flat:
@@ -1158,12 +1199,15 @@ async def plot_histogram(interaction: discord.Interaction, top_n: Optional[int] 
 
         per_user: Dict[tuple, Dict] = {}
         for uid, uname, _day, score, solved, _ts in rows:
-            if is_player_excluded(uid):
+            if uid and is_player_excluded(uid):
                 continue
             key = identity_key(uid or 0, uname or "")
             label = label_plain_for_hist(interaction.guild, uid or 0, uname or "Unknown")
-            entry = per_user.setdefault(key, {"label": label, "uid": (uid or alias_lookup(uname)), "counts": {i:0 for i in range(1,8)}})
-            s = (score if solved == 1 else 7)
+            entry = per_user.setdefault(
+                key,
+                {"label": label, "uid": (uid or alias_lookup(uname)), "counts": {i:0 for i in range(1,8)}},
+            )
+            s = (int(score) if solved == 1 and score is not None else 7)
             entry["counts"][s] += 1
 
         for key, d in per_user.items():
@@ -1178,11 +1222,13 @@ async def plot_histogram(interaction: discord.Interaction, top_n: Optional[int] 
             flat = []
             for g, c in d["counts"].items():
                 flat.extend([g]*c)
-            if not flat: continue
+            if not flat:
+                continue
             avg = sum(flat)/len(flat)
             ranked.append((avg, key, d))
         ranked.sort(key=lambda t: t[0])
-        if top_n: ranked = ranked[: top_n]
+        if top_n:
+            ranked = ranked[: top_n]
 
         guesses = list(range(1, 8))
         n_users = max(1, len(ranked))
@@ -1200,10 +1246,10 @@ async def plot_histogram(interaction: discord.Interaction, top_n: Optional[int] 
             xs = [c + (i - (n_users-1)/2)*width for c in centers]
             uid = d["uid"] or 0
             color = get_user_color(interaction.guild, uid) if uid else None
-            bars = ax.bar(xs, counts, width=width, label=f"{d['label']} (avg {avg:.2f})", color=color)
+            bars = ax.bar(xs, counts, width=width, color=color)
             _annotate_bars(ax, bars, counts, fmt=lambda v: f"{int(v)}", min_show=0.0)
             max_y = max(max_y, max(counts) if counts else 0)
-            handles.append(Patch(color=color if color else 'tab:blue'))
+            handles.append(Patch(color=color if color else "tab:blue"))
             labels.append(f"{d['label']} (avg {avg:.2f})")
 
         ax.set_xticks(centers, [1,2,3,4,5,6,"X"])
@@ -1213,7 +1259,8 @@ async def plot_histogram(interaction: discord.Interaction, top_n: Optional[int] 
         ax.set_ylim(top=max_y * 1.15 + 0.5)
 
         ncols = max(2, min(n_users, 6))
-        ax.legend(handles=handles, labels=labels, loc="upper center", bbox_to_anchor=(0.5, -0.14), ncol=ncols, frameon=False)
+        ax.legend(handles=handles, labels=labels, loc="upper center",
+                  bbox_to_anchor=(0.5, -0.14), ncol=ncols, frameon=False)
         fig.tight_layout()
 
         buf = io.BytesIO()
@@ -1236,12 +1283,15 @@ async def plot_normalized(interaction: discord.Interaction, top_n: Optional[int]
 
         per_user: Dict[tuple, Dict] = {}
         for uid, uname, _day, score, solved, _ts in rows:
-            if is_player_excluded(uid):
+            if uid and is_player_excluded(uid):
                 continue
             key = identity_key(uid or 0, uname or "")
             label = label_plain_for_hist(interaction.guild, uid or 0, uname or "Unknown")
-            entry = per_user.setdefault(key, {"label": label, "uid": (uid or alias_lookup(uname)), "counts": {i:0 for i in range(1,8)}})
-            s = (score if solved == 1 else 7)
+            entry = per_user.setdefault(
+                key,
+                {"label": label, "uid": (uid or alias_lookup(uname)), "counts": {i:0 for i in range(1,8)}},
+            )
+            s = (int(score) if solved == 1 and score is not None else 7)
             entry["counts"][s] += 1
 
         for key, d in per_user.items():
@@ -1254,14 +1304,16 @@ async def plot_normalized(interaction: discord.Interaction, top_n: Optional[int]
         ranked = []
         for key, d in per_user.items():
             total = sum(d["counts"].values())
-            if total == 0: continue
+            if total == 0:
+                continue
             flat = []
             for g, c in d["counts"].items():
                 flat.extend([g]*c)
             avg = sum(flat)/len(flat)
             ranked.append((avg, key, d, total))
         ranked.sort(key=lambda t: t[0])
-        if top_n: ranked = ranked[: top_n]
+        if top_n:
+            ranked = ranked[: top_n]
 
         guesses = list(range(1, 8))
         n_users = max(1, len(ranked))
@@ -1279,10 +1331,10 @@ async def plot_normalized(interaction: discord.Interaction, top_n: Optional[int]
             xs = [c + (i - (n_users-1)/2)*width for c in centers]
             uid = d["uid"] or 0
             color = get_user_color(interaction.guild, uid) if uid else None
-            bars = ax.bar(xs, percents, width=width, label=f"{d['label']} (avg {avg:.2f})", color=color)
+            bars = ax.bar(xs, percents, width=width, color=color)
             _annotate_bars(ax, bars, percents, fmt=lambda v: f"{v:.0f}%", min_show=0.5)
             max_y = max(max_y, max(percents) if percents else 0.0)
-            handles.append(Patch(color=color if color else 'tab:blue'))
+            handles.append(Patch(color=color if color else "tab:blue"))
             labels.append(f"{d['label']} (avg {avg:.2f})")
 
         ax.set_xticks(centers, [1,2,3,4,5,6,"X"])
@@ -1292,7 +1344,8 @@ async def plot_normalized(interaction: discord.Interaction, top_n: Optional[int]
         ax.set_ylim(0, max(100.0, max_y * 1.15 + 2.0))
 
         ncols = max(2, min(n_users, 6))
-        ax.legend(handles=handles, labels=labels, loc="upper center", bbox_to_anchor=(0.5, -0.14), ncol=ncols, frameon=False)
+        ax.legend(handles=handles, labels=labels, loc="upper center",
+                  bbox_to_anchor=(0.5, -0.14), ncol=ncols, frameon=False)
         fig.tight_layout()
 
         buf = io.BytesIO()
@@ -1357,7 +1410,6 @@ async def retcon_export(interaction: discord.Interaction):
         await interaction.response.send_message("Not authorized.", ephemeral=True)
         return
     try:
-        # ensure latest DB -> file
         save_retcons_file()
         with open(RETCONS_FILE, "rb") as f:
             buf = io.BytesIO(f.read())
@@ -1389,7 +1441,7 @@ async def rescan(interaction: discord.Interaction, limit: Optional[int] = 500):
         await interaction.followup.send("Error during rescan.", ephemeral=True)
 
 
-# ========= Entrypoint with graceful backoff =========
+# ========= Entrypoint (FIXED: single run, no manual login retries) =========
 if __name__ == "__main__":
     if not TOKEN:
         raise SystemExit("Missing DISCORD_BOT_TOKEN in environment.")
@@ -1399,9 +1451,6 @@ if __name__ == "__main__":
     except Exception:
         logging.basicConfig(level=logging.INFO)
 
-    async def run_with_backoff():
-        backoff = 60
-        run_with_backoff(TOKEN)
-
-
-    asyncio.run(run_with_backoff())
+    # IMPORTANT: Do not wrap bot.run in retry loops.
+    # discord.py handles reconnects internally. Retry loops cause 429 + session closed on Render.
+    bot.run(TOKEN)
