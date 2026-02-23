@@ -4,6 +4,8 @@ import os, io, re, sqlite3, datetime as dt, traceback, unicodedata, difflib, jso
 from dataclasses import dataclass
 from typing import Optional, List, Tuple, Dict
 
+import time
+
 import discord
 from discord import app_commands
 from discord.ext import commands
@@ -1442,6 +1444,7 @@ async def rescan(interaction: discord.Interaction, limit: Optional[int] = 500):
 
 
 # ========= Entrypoint (FIXED: single run, no manual login retries) =========
+# ========= Entrypoint =========
 if __name__ == "__main__":
     if not TOKEN:
         raise SystemExit("Missing DISCORD_BOT_TOKEN in environment.")
@@ -1454,16 +1457,15 @@ if __name__ == "__main__":
     try:
         bot.run(TOKEN)
     except discord.HTTPException as e:
-        # If Discord/Cloudflare blocks the IP, Render restarts can cause a login storm.
-        # Sleep a long time to avoid rapid re-logins from the same IP.
         logging.error("Discord HTTPException during login/run: %r", e)
 
-        # Heuristic: Cloudflare 1015 and/or HTML "Access denied" is often embedded in the error text
         msg = str(e)
+        # Cloudflare blocks often include HTML with these strings
         if "1015" in msg or "Cloudflare" in msg or "Access denied" in msg:
-            logging.error("Detected Cloudflare rate limit / IP block. Sleeping to avoid restart storm.")
-            time.sleep(60 * 30)  # 30 minutes
+            logging.error("Detected Cloudflare rate limit / IP block. Sleeping indefinitely to avoid restart storm.")
+            while True:
+                time.sleep(60 * 30)  # 30 min chunks forever
         else:
-            time.sleep(60 * 5)   # 5 minutes fallback
-
-        raise
+            logging.error("Non-Cloudflare HTTPException. Sleeping indefinitely to avoid rapid relogins.")
+            while True:
+                time.sleep(60 * 5)
