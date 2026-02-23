@@ -1451,6 +1451,19 @@ if __name__ == "__main__":
     except Exception:
         logging.basicConfig(level=logging.INFO)
 
-    # IMPORTANT: Do not wrap bot.run in retry loops.
-    # discord.py handles reconnects internally. Retry loops cause 429 + session closed on Render.
-    bot.run(TOKEN)
+    try:
+        bot.run(TOKEN)
+    except discord.HTTPException as e:
+        # If Discord/Cloudflare blocks the IP, Render restarts can cause a login storm.
+        # Sleep a long time to avoid rapid re-logins from the same IP.
+        logging.error("Discord HTTPException during login/run: %r", e)
+
+        # Heuristic: Cloudflare 1015 and/or HTML "Access denied" is often embedded in the error text
+        msg = str(e)
+        if "1015" in msg or "Cloudflare" in msg or "Access denied" in msg:
+            logging.error("Detected Cloudflare rate limit / IP block. Sleeping to avoid restart storm.")
+            time.sleep(60 * 30)  # 30 minutes
+        else:
+            time.sleep(60 * 5)   # 5 minutes fallback
+
+        raise
