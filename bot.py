@@ -1,14 +1,20 @@
 from __future__ import annotations
 
 import os, io, re, sqlite3, datetime as dt, traceback, unicodedata, difflib, json, math, asyncio, logging
+import time
 from dataclasses import dataclass
 from typing import Optional, List, Tuple, Dict
-
-import time
 
 import discord
 from discord import app_commands
 from discord.ext import commands
+
+# Web service health endpoint (for Render Web Services)
+try:
+    from aiohttp import web
+except Exception as _e:
+    web = None  # type: ignore
+
 
 # Optional .env locally
 try:
@@ -1443,9 +1449,41 @@ async def rescan(interaction: discord.Interaction, limit: Optional[int] = 500):
         await interaction.followup.send("Error during rescan.", ephemeral=True)
 
 
-# ========= Entrypoint (FIXED: single run, no manual login retries) =========
-# ========= Entrypoint =========
-if __name__ == "__main__":
+# ========= Entrypoint (Render Web Service: one process runs HTTP + Discord bot) =========
+# NOTE:
+# - Run this as a Render "Web Service" with Start Command: `python bot.py`
+# - This process binds to $PORT so Render doesn't restart it for lacking a listener.
+# - We intentionally avoid custom login retry loops. If Discord/Cloudflare blocks the IP (1015/429),
+#   we keep the web service alive and wait, instead of hammering login.
+
+async def _start_health_server() -> "web.AppRunner | None":
+    if web is None:
+        logging.error("aiohttp is not available; cannot start health server for Web Service mode.")
+        return None
+
+    app = web.Application()
+
+    async def root(_request: "web.Request") -> "web.Response":
+        return web.Response(text="ok")
+
+    async def healthz(_request: "web.Request") -> "web.Response":
+        return web.Response(text="ok")
+
+    app.router.add_get("/", root)
+    app.router.add_get("/healthz", healthz)
+
+    runner = web.AppRunner(app)
+    await runner.setup()
+
+    port = int(os.environ.get("PORT", "10000"))
+    site = web.TCPSite(runner, host="0.0.0.0", port=port)
+    await site.start()
+
+    logging.info("[web] Health server listening on 0.0.0.0:%s", port)
+    return runner
+
+
+async def _run_webservice() -> None:
     if not TOKEN:
         raise SystemExit("Missing DISCORD_BOT_TOKEN in environment.")
 
@@ -1454,18 +1492,40 @@ if __name__ == "__main__":
     except Exception:
         logging.basicConfig(level=logging.INFO)
 
-    try:
-        bot.run(TOKEN)
-    except discord.HTTPException as e:
-        logging.error("Discord HTTPException during login/run: %r", e)
+    # Start HTTP health server first (so Render sees an open port even if Discord is rate limiting)
+    runner = await _start_health_server()
 
+    try:
+        logging.info("[discord] Starting bot…")
+        await bot.start(TOKEN)
+    except discord.HTTPException as e:
+        # If Discord/Cloudflare blocks the Render egress IP, retrying quickly makes it worse.
+        logging.error("[discord] HTTPException during login/start: %r", e)
         msg = str(e)
-        # Cloudflare blocks often include HTML with these strings
         if "1015" in msg or "Cloudflare" in msg or "Access denied" in msg:
-            logging.error("Detected Cloudflare rate limit / IP block. Sleeping indefinitely to avoid restart storm.")
+            logging.error("[discord] Cloudflare rate limit / IP block detected. Waiting 30 minutes before any manual redeploy.")
             while True:
-                time.sleep(60 * 30)  # 30 min chunks forever
+                await asyncio.sleep(60 * 30)
         else:
-            logging.error("Non-Cloudflare HTTPException. Sleeping indefinitely to avoid rapid relogins.")
+            logging.error("[discord] HTTPException. Waiting 5 minutes before any manual redeploy.")
             while True:
-                time.sleep(60 * 5)
+                await asyncio.sleep(60 * 5)
+    except Exception as e:
+        logging.exception("[discord] Unexpected fatal error: %r", e)
+        # Keep the web service alive to avoid restart storms; you can check logs and redeploy.
+        while True:
+            await asyncio.sleep(60 * 5)
+    finally:
+        try:
+            await bot.close()
+        except Exception:
+            pass
+        if runner is not None:
+            try:
+                await runner.cleanup()
+            except Exception:
+                pass
+
+
+if __name__ == "__main__":
+    asyncio.run(_run_webservice())
