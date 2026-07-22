@@ -524,20 +524,24 @@ class ParsedScore:
     score: Optional[int]   # None => X
     solved: bool
 
-DAY_RE_TEXT = re.compile(r"\bWordle\s+(?:No\.?\s*)?(?P<day>\d+)\b", re.IGNORECASE)
+DAY_RE_TEXT = re.compile(r"\bWordle\s+(?:No\.?\s*)?(?P<day>[\d,]+)\b", re.IGNORECASE)
 SCORE_LINE_RE = re.compile(r"^(?:\*\*)?(?:👑\s*)?(?P<score>[Xx]|\d)\/6:\s*(?P<rest>.+)$")
 
 def _extract_day_from_message(msg: discord.Message) -> Optional[int]:
+    # NOTE: the "Wordle No. N" shown in the embed is the puzzle that just opened
+    # (the one the "Play now!" button links to). The score lines in msg.content
+    # above it are explicitly labeled "yesterday's results" — i.e. they belong to
+    # puzzle N-1, not N. Subtract 1 so the stored day matches the scores.
     m = DAY_RE_TEXT.search(msg.content or "")
     if m:
-        return int(m.group("day"))
+        return int(m.group("day").replace(",", "")) - 1
     for emb in msg.embeds:
         if emb.title:
             m = DAY_RE_TEXT.search(emb.title)
-            if m: return int(m.group("day"))
+            if m: return int(m.group("day").replace(",", "")) - 1
         if emb.description:
             m = DAY_RE_TEXT.search(emb.description)
-            if m: return int(m.group("day"))
+            if m: return int(m.group("day").replace(",", "")) - 1
     return None
 
 def parse_group_summary_style(msg: discord.Message) -> List[ParsedScore]:
@@ -621,9 +625,9 @@ async def do_rescan_channel(channel: discord.abc.Messageable, limit: int) -> int
                 upsert_score(p.user_id or 0, p.username, p.day, p.score, p.solved)
                 parsed += 1
             continue
-        m = re.search(r"\bWordle\s+(?P<day>\d+)\s+(?P<score>[Xx]|\d)\/6\b", msg.content or "", re.IGNORECASE)
+        m = re.search(r"\bWordle\s+(?P<day>[\d,]+)\s+(?P<score>[Xx]|\d)\/6\b", msg.content or "", re.IGNORECASE)
         if m:
-            day = int(m.group("day"))
+            day = int(m.group("day").replace(",", ""))
             s = m.group("score")
             score_val = None if s.lower() == "x" else int(s)
             upsert_score(msg.author.id, msg.author.display_name, day, score_val, score_val is not None)
@@ -762,11 +766,12 @@ async def on_message(message: discord.Message):
     except Exception:
         traceback.print_exc()
     try:
-        m = re.search(r"\bWordle\s+(?P<day>\d+)\s+(?P<score>[Xx]|\d)\/6\b", message.content or "", re.IGNORECASE)
-        if m:
-            day = int(m.group("day")); s = m.group("score")
-            score_val = None if s.lower() == "x" else int(s)
-            upsert_score(message.author.id, message.author.display_name, day, score_val, score_val is not None)
+        if not message.author.bot:
+            m = re.search(r"\bWordle\s+(?P<day>[\d,]+)\s+(?P<score>[Xx]|\d)\/6\b", message.content or "", re.IGNORECASE)
+            if m:
+                day = int(m.group("day").replace(",", "")); s = m.group("score")
+                score_val = None if s.lower() == "x" else int(s)
+                upsert_score(message.author.id, message.author.display_name, day, score_val, score_val is not None)
     except Exception:
         traceback.print_exc()
     await bot.process_commands(message)
