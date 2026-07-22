@@ -926,8 +926,8 @@ async def alias_export(interaction: discord.Interaction):
 )
 async def toggle_player(
     interaction: discord.Interaction,
-    user: discord.User | None = None,
-    user_id: str | None = None
+    user: Optional[discord.User] = None,
+    user_id: Optional[str] = None
 ):
     if (user is None and user_id is None) or (user is not None and user_id is not None):
         await interaction.response.send_message(
