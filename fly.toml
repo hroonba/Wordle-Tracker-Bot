@@ -1,6 +1,6 @@
 # Replace "your-bot-name-here" with a unique name, and set primary_region
 # to whatever region you pick when creating the app (e.g. "iad", "ord", "lhr").
-app = "your-bot-name-here"
+app = "wordle-tracker-bot"
 primary_region = "iad"
 
 [build]
