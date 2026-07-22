@@ -576,6 +576,8 @@ def parse_group_summary_style(msg: discord.Message) -> List[ParsedScore]:
             segs = [s.strip() for s in rest.split("@") if s.strip()]
             for seg in segs:
                 uid, label = best_match_member_or_alias(msg.guild, seg)
+                if uid and alias_lookup(seg) != uid:
+                    alias_set(seg, uid)  # pin this exact name permanently, survives future renames
                 out.append(ParsedScore(user_id=uid, username=label, day=day, score=score_val, solved=solved))
             continue
 
@@ -586,6 +588,8 @@ def parse_group_summary_style(msg: discord.Message) -> List[ParsedScore]:
                     out.append(ParsedScore(user_id=uid, username=display, day=day, score=score_val, solved=solved))
             else:
                 uid, display = resolve_name_to_member(msg.guild, rest)
+                if uid and alias_lookup(rest) != uid:
+                    alias_set(rest, uid)  # pin this exact name permanently, survives future renames
                 out.append(ParsedScore(user_id=uid, username=display, day=day, score=score_val, solved=solved))
 
     return out
@@ -916,6 +920,30 @@ async def alias_export(interaction: discord.Interaction):
     except Exception as e:
         traceback.print_exc()
         await interaction.response.send_message(f"Export failed: {e!r}", ephemeral=True)
+
+@tree.command(description="Admin: pin an alias for every already-resolved name in score history (protects against future nickname changes)")
+async def backfill_aliases(interaction: discord.Interaction):
+    if OWNER_ID and interaction.user.id != OWNER_ID:
+        await interaction.response.send_message("Not authorized.", ephemeral=True); return
+    if not await safe_defer(interaction, ephemeral=True): return
+    try:
+        with sqlite3.connect(DB_PATH) as con:
+            rows = list(con.execute("SELECT DISTINCT username, user_id FROM scores WHERE user_id <> 0;"))
+        count = 0
+        for uname, uid in rows:
+            if not uname:
+                continue
+            if alias_lookup(uname) != uid:
+                alias_set(uname, uid)
+                count += 1
+        await interaction.followup.send(
+            f"Pinned {count} alias(es) from existing score history. "
+            f"These names will now always resolve to the right person, even after future nickname changes.",
+            ephemeral=True,
+        )
+    except Exception:
+        traceback.print_exc()
+        await interaction.followup.send("Error backfilling aliases.", ephemeral=True)
 
 
 # --- Player toggle: user OR user_id; toggles excluded_players list ---
