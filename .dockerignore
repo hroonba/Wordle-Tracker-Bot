@@ -8,3 +8,6 @@ __pycache__/
 aliases.json
 retcons.json
 players.json
+.git/
+.gitignore
+README.md

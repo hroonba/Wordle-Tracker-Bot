@@ -1,0 +1,25 @@
+# Replace "your-bot-name-here" with a unique name, and set primary_region
+# to whatever region you pick when creating the app (e.g. "iad", "ord", "lhr").
+app = "your-bot-name-here"
+primary_region = "iad"
+
+[build]
+
+# No [[services]] / [http_service] block on purpose — this bot only makes an
+# outbound connection to Discord's gateway, so it doesn't need to be publicly
+# reachable, and Fly won't try to idle/downscale a machine that has no
+# public service defined.
+
+[env]
+  DB_PATH       = "/data/wordle_scores.db"
+  ALIASES_FILE  = "/data/aliases.json"
+  RETCONS_FILE  = "/data/retcons.json"
+  PLAYERS_FILE  = "/data/players.json"
+
+[mounts]
+  source      = "wordle_data"
+  destination = "/data"
+
+[[vm]]
+  size   = "shared-cpu-1x"
+  memory = "512mb"
